@@ -1,7 +1,13 @@
 """Tests for server error formatting and MCP instructions field."""
 
+import pytest
+
 from adloop.ads.gaql import _parse_gaql_error
-from adloop.server import _build_orchestration_instructions, _structured_error
+from adloop.server import (
+    _build_orchestration_instructions,
+    _coerce_json_string_to_list,
+    _structured_error,
+)
 
 
 def test_structured_error_detects_invalid_developer_token():
@@ -133,3 +139,95 @@ class TestOrchestrationInstructions:
             "MCP instructions field should be the compact orchestration hint, "
             "not a placeholder"
         )
+
+
+class TestListParamJsonStringCoercion:
+    """Regression for issue #28 — some MCP clients (e.g. Cowork) serialize
+    list-typed tool arguments as JSON-encoded strings rather than native
+    arrays, causing Pydantic to reject the call with ``Input should be a
+    valid list``. ``_coerce_json_string_to_list`` runs as a ``BeforeValidator``
+    on every tool param annotated with ``_StrList``/``_StrListOpt``/
+    ``_DictList``/``_DictListOpt`` and decodes the JSON before the standard
+    list validator runs.
+    """
+
+    def test_passes_through_native_list(self):
+        assert _coerce_json_string_to_list(["a", "b"]) == ["a", "b"]
+
+    def test_passes_through_none(self):
+        assert _coerce_json_string_to_list(None) is None
+
+    def test_decodes_json_encoded_str_list_of_strings(self):
+        assert _coerce_json_string_to_list('["pagePath"]') == ["pagePath"]
+
+    def test_decodes_json_encoded_str_list_with_multiple_metrics(self):
+        encoded = '["sessions", "totalUsers", "screenPageViews", "bounceRate"]'
+        assert _coerce_json_string_to_list(encoded) == [
+            "sessions",
+            "totalUsers",
+            "screenPageViews",
+            "bounceRate",
+        ]
+
+    def test_decodes_json_encoded_str_list_of_dicts(self):
+        encoded = '[{"text": "shoes", "match_type": "EXACT"}]'
+        assert _coerce_json_string_to_list(encoded) == [
+            {"text": "shoes", "match_type": "EXACT"}
+        ]
+
+    def test_non_list_json_string_passes_through_unchanged(self):
+        # ``'42'`` and ``'"pagePath"'`` decode to non-list values. We must
+        # NOT pretend they're lists — let Pydantic's normal list validator
+        # raise the standard error so the client sees a useful schema
+        # violation rather than a silently-mangled payload.
+        assert _coerce_json_string_to_list("42") == "42"
+        assert _coerce_json_string_to_list('"pagePath"') == '"pagePath"'
+
+    def test_invalid_json_string_passes_through_unchanged(self):
+        # Bare strings like ``pagePath`` aren't valid JSON. Pass them through
+        # so Pydantic emits the standard ``Input should be a valid list``
+        # error (which is the correct response — that input is genuinely
+        # not a list, JSON-encoded or otherwise).
+        assert _coerce_json_string_to_list("pagePath") == "pagePath"
+
+    def test_empty_string_passes_through_unchanged(self):
+        assert _coerce_json_string_to_list("") == ""
+
+
+class TestListParamJsonStringCoercionEndToEnd:
+    """End-to-end: the BeforeValidator must fire through Pydantic when the
+    annotated types are used in a model. If this ever breaks (e.g. because
+    we accidentally drop the ``Annotated`` wrapper), the unit-level tests
+    above would still pass but the real-world fix would be silently gone.
+    """
+
+    def _model_with_str_list(self):
+        from pydantic import BaseModel
+
+        from adloop.server import _StrList, _StrListOpt
+
+        class _M(BaseModel):
+            required: _StrList
+            optional: _StrListOpt = None
+
+        return _M
+
+    def test_pydantic_accepts_json_encoded_string_for_required_list(self):
+        model_cls = self._model_with_str_list()
+        m = model_cls(required='["pagePath"]')
+        assert m.required == ["pagePath"]
+
+    def test_pydantic_accepts_json_encoded_string_for_optional_list(self):
+        model_cls = self._model_with_str_list()
+        m = model_cls(required=["a"], optional='["b", "c"]')
+        assert m.optional == ["b", "c"]
+
+    def test_pydantic_still_rejects_non_list_strings(self):
+        model_cls = self._model_with_str_list()
+        with pytest.raises(Exception, match="valid list"):
+            model_cls(required="pagePath")  # bare string, not JSON
+
+    def test_pydantic_still_accepts_native_arrays(self):
+        model_cls = self._model_with_str_list()
+        m = model_cls(required=["a", "b"])
+        assert m.required == ["a", "b"]

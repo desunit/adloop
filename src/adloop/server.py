@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import functools
-from typing import Callable
+import json
+from typing import Annotated, Callable
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BeforeValidator
 
 from adloop import _mcp_patches, diagnostics
 from adloop.config import load_config
@@ -17,6 +19,44 @@ _mcp_patches.install()
 _READONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 _DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+
+
+def _coerce_json_string_to_list(value):
+    """Decode a JSON-array-shaped string into a native list.
+
+    Some MCP clients (Cowork at the time of writing — see issue #28)
+    serialize list-typed tool arguments as JSON-encoded strings rather
+    than native arrays. Pydantic v2 rejects those calls with
+    ``Input should be a valid list`` because string→list isn't a default
+    coercion. This validator detects the pattern (``"[...]"``) and decodes
+    it to an actual list so the standard list validator can proceed.
+
+    Anything that isn't a JSON-encoded list passes through untouched —
+    so legitimate native arrays and ``None`` are unaffected. The fix is
+    invisible to the JSON schema (``Annotated`` metadata isn't included
+    in schema generation), so well-behaved clients keep sending arrays.
+    """
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+        if isinstance(decoded, list):
+            return decoded
+    return value
+
+
+# JSON-string-tolerant list aliases. Applied to every tool parameter that
+# accepts a list so the server works equally well against clients that
+# send native arrays and clients that pre-serialize them as JSON strings.
+_StrList = Annotated[list[str], BeforeValidator(_coerce_json_string_to_list)]
+_StrListOpt = Annotated[
+    list[str] | None, BeforeValidator(_coerce_json_string_to_list)
+]
+_DictList = Annotated[list[dict], BeforeValidator(_coerce_json_string_to_list)]
+_DictListOpt = Annotated[
+    list[dict] | None, BeforeValidator(_coerce_json_string_to_list)
+]
 
 def _build_orchestration_instructions() -> str:
     """Compact orchestration hint sent via MCP ``InitializeResult.instructions``.
@@ -270,8 +310,8 @@ def get_account_summaries() -> dict:
 @mcp.tool(annotations=_READONLY)
 @_safe
 def run_ga4_report(
-    dimensions: list[str] | None = None,
-    metrics: list[str] | None = None,
+    dimensions: _StrListOpt = None,
+    metrics: _StrListOpt = None,
     date_range_start: str = "7daysAgo",
     date_range_end: str = "today",
     property_id: str = "",
@@ -301,8 +341,8 @@ def run_ga4_report(
 @mcp.tool(annotations=_READONLY)
 @_safe
 def run_realtime_report(
-    dimensions: list[str] | None = None,
-    metrics: list[str] | None = None,
+    dimensions: _StrListOpt = None,
+    metrics: _StrListOpt = None,
     property_id: str = "",
 ) -> dict:
     """Run a GA4 realtime report showing current active users and events.
@@ -540,7 +580,7 @@ def get_negative_keyword_list_campaigns(
 @_safe
 def get_recommendations(
     customer_id: str = "",
-    recommendation_types: list[str] | None = None,
+    recommendation_types: _StrListOpt = None,
     campaign_id: str = "",
 ) -> dict:
     """Retrieve Google's auto-generated recommendations with estimated impact.
@@ -747,7 +787,7 @@ def attribution_check(
     date_range_end: str = "",
     customer_id: str = "",
     property_id: str = "",
-    conversion_events: list[str] | None = None,
+    conversion_events: _StrListOpt = None,
 ) -> dict:
     """Compare Ads-reported conversions vs GA4 — find tracking discrepancies.
 
@@ -806,14 +846,14 @@ def draft_campaign(
     campaign_name: str,
     daily_budget: float,
     bidding_strategy: str,
-    geo_target_ids: list[str],
-    language_ids: list[str],
+    geo_target_ids: _StrList,
+    language_ids: _StrList,
     customer_id: str = "",
     target_cpa: float = 0,
     target_roas: float = 0,
     channel_type: str = "SEARCH",
     ad_group_name: str = "",
-    keywords: list[dict] | None = None,
+    keywords: _DictListOpt = None,
     search_partners_enabled: bool = False,
     display_network_enabled: bool | None = None,
     display_expansion_enabled: bool | None = None,
@@ -872,7 +912,7 @@ def draft_campaign(
 def draft_ad_group(
     campaign_id: str,
     ad_group_name: str,
-    keywords: list[dict] | None = None,
+    keywords: _DictListOpt = None,
     customer_id: str = "",
     cpc_bid_micros: int = 0,
 ) -> dict:
@@ -909,8 +949,8 @@ def update_campaign(
     target_cpa: float = 0,
     target_roas: float = 0,
     daily_budget: float = 0,
-    geo_target_ids: list[str] | None = None,
-    language_ids: list[str] | None = None,
+    geo_target_ids: _StrListOpt = None,
+    language_ids: _StrListOpt = None,
     search_partners_enabled: bool | None = None,
     display_network_enabled: bool | None = None,
     display_expansion_enabled: bool | None = None,
@@ -1004,7 +1044,7 @@ def draft_responsive_search_ad(
 @_safe
 def draft_keywords(
     ad_group_id: str,
-    keywords: list[dict],
+    keywords: _DictList,
     customer_id: str = "",
 ) -> dict:
     """Draft keyword additions — returns a PREVIEW, does NOT add keywords.
@@ -1026,7 +1066,7 @@ def draft_keywords(
 @_safe
 def add_negative_keywords(
     campaign_id: str,
-    keywords: list[str],
+    keywords: _StrList,
     customer_id: str = "",
     match_type: str = "EXACT",
 ) -> dict:
@@ -1052,7 +1092,7 @@ def add_negative_keywords(
 def propose_negative_keyword_list(
     campaign_id: str,
     list_name: str,
-    keywords: list[str],
+    keywords: _StrList,
     customer_id: str = "",
     match_type: str = "EXACT",
 ) -> dict:
@@ -1079,7 +1119,7 @@ def propose_negative_keyword_list(
 @_safe
 def add_to_negative_keyword_list(
     shared_set_id: str,
-    keywords: list[str],
+    keywords: _StrList,
     customer_id: str = "",
     match_type: str = "EXACT",
 ) -> dict:
@@ -1112,7 +1152,7 @@ def add_to_negative_keyword_list(
 @_safe
 def attach_shared_set_to_campaigns(
     shared_set_id: str,
-    campaign_ids: list[str],
+    campaign_ids: _StrList,
     customer_id: str = "",
 ) -> dict:
     """Attach an existing shared set to one or more campaigns — returns a PREVIEW.
@@ -1143,7 +1183,7 @@ def attach_shared_set_to_campaigns(
 @_safe
 def detach_shared_set_from_campaigns(
     shared_set_id: str,
-    campaign_ids: list[str],
+    campaign_ids: _StrList,
     customer_id: str = "",
 ) -> dict:
     """Detach a shared set from one or more campaigns — returns a PREVIEW.
@@ -1194,7 +1234,7 @@ def update_ad_group(
 @_safe
 def draft_callouts(
     campaign_id: str,
-    callouts: list[str],
+    callouts: _StrList,
     customer_id: str = "",
 ) -> dict:
     """Draft campaign callout assets — returns a PREVIEW."""
@@ -1212,7 +1252,7 @@ def draft_callouts(
 @_safe
 def draft_structured_snippets(
     campaign_id: str,
-    snippets: list[dict],
+    snippets: _DictList,
     customer_id: str = "",
 ) -> dict:
     """Draft campaign structured snippet assets — returns a PREVIEW."""
@@ -1230,7 +1270,7 @@ def draft_structured_snippets(
 @_safe
 def draft_image_assets(
     campaign_id: str,
-    image_paths: list[str],
+    image_paths: _StrList,
     customer_id: str = "",
 ) -> dict:
     """Draft campaign image assets from local PNG, JPEG, or GIF files."""
@@ -1340,7 +1380,7 @@ def remove_entity(
 @_safe
 def draft_sitelinks(
     campaign_id: str,
-    sitelinks: list[dict],
+    sitelinks: _DictList,
     customer_id: str = "",
 ) -> dict:
     """Draft sitelink extensions for a campaign — returns a PREVIEW.
@@ -1404,7 +1444,7 @@ def confirm_and_apply(
 @mcp.tool(annotations=_READONLY)
 @_safe
 def validate_tracking(
-    expected_events: list[str],
+    expected_events: _StrList,
     property_id: str = "",
     date_range_start: str = "28daysAgo",
     date_range_end: str = "today",
@@ -1467,7 +1507,7 @@ def generate_tracking_code(
 @mcp.tool(annotations=_READONLY)
 @_safe
 def estimate_budget(
-    keywords: list[dict],
+    keywords: _DictList,
     daily_budget: float = 0,
     geo_target_id: str = "2276",
     language_id: str = "1000",
@@ -1502,7 +1542,7 @@ def estimate_budget(
 @mcp.tool(annotations=_READONLY)
 @_safe
 def discover_keywords(
-    seed_keywords: list[str] = [],  # noqa: B006 — mutable default required for MCP JSON schema
+    seed_keywords: _StrList = [],  # noqa: B006 — mutable default required for MCP JSON schema
     url: str = "",
     geo_target_id: str = "2276",
     language_id: str = "1000",
