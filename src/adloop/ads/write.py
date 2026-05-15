@@ -672,13 +672,36 @@ def update_ad_group(
     if max_cpc < 0:
         errors.append("max_cpc cannot be negative")
     if max_cpc:
-        uses_manual_cpc = _ad_group_uses_manual_cpc(config, customer_id, ad_group_id)
-        if uses_manual_cpc is False:
-            errors.append("max_cpc requires an ad group in a MANUAL_CPC campaign")
-        elif uses_manual_cpc is None:
+        strategy = _ad_group_campaign_bidding_strategy(
+            config, customer_id, ad_group_id
+        )
+        if strategy is None:
             errors.append(
                 f"Unable to verify bidding strategy for ad_group_id '{ad_group_id}'"
             )
+        elif strategy != "MANUAL_CPC":
+            # Per Google Ads docs, ad-group CPC bids are ignored under every
+            # automated bidding strategy — effective_cpc_bid_micros is always 0
+            # and the campaign-level constraint (cpc_bid_ceiling for
+            # TARGET_SPEND, target CPA/ROAS otherwise) is the only thing that
+            # affects spend. Telling the user "requires MANUAL_CPC" makes it
+            # sound like a tool limitation; the real story is that the bid
+            # would be a no-op. Point at the right next step for the strategy.
+            # https://support.google.com/google-ads/answer/6336101
+            if strategy == "TARGET_SPEND":
+                errors.append(
+                    "Maximize Clicks (TARGET_SPEND) ignores ad-group CPC bids. "
+                    "The campaign cpc_bid_ceiling is the active constraint — "
+                    "set it via update_campaign(max_cpc=...) instead. "
+                    "No change made."
+                )
+            else:
+                errors.append(
+                    f"{strategy} ignores ad-group CPC bids "
+                    f"(effective_cpc_bid_micros = 0). The campaign-level "
+                    f"target governs spend under automated bidding. "
+                    f"No change made."
+                )
 
     has_any_change = bool(ad_group_name.strip() or max_cpc)
     if not has_any_change:
@@ -1061,6 +1084,27 @@ def update_campaign(
             f"{format_currency(target_cpa, currency_code)}. Google recommends at least 5x."
         )
 
+    # Surface negative geo exclusions that will survive a positive-geo
+    # replacement. Issue #32: the previous implementation silently dropped
+    # negative location criteria along with positive ones during a geo
+    # replace — users only noticed when excluded-region traffic appeared in
+    # reports. Negatives are now preserved (see ``_apply_update_campaign``);
+    # this preview note makes the preserved-set explicit so the change is
+    # auditable rather than implicit.
+    preserved_negative_geos: list[str] = []
+    if geo_target_ids is not None and campaign_id:
+        preserved_negative_geos = _existing_negative_geo_exclusions(
+            config, customer_id, campaign_id
+        )
+        if preserved_negative_geos:
+            warnings.append(
+                "Negative geo exclusions on this campaign will be PRESERVED "
+                f"(geo_target_constant IDs: {sorted(preserved_negative_geos)}). "
+                "Only positive geo targets are being replaced. To remove a "
+                "negative exclusion, use remove_entity with "
+                'entity_type="campaign_criterion".'
+            )
+
     changes: dict = {"campaign_id": campaign_id}
     if bs:
         changes["bidding_strategy"] = bs
@@ -1092,6 +1136,10 @@ def update_campaign(
     preview = plan.to_preview()
     if warnings:
         preview["warnings"] = warnings
+    if preserved_negative_geos:
+        preview["preserved_negative_geo_target_ids"] = sorted(
+            preserved_negative_geos
+        )
     return preview
 
 
@@ -1499,10 +1547,52 @@ def _campaign_bidding_strategy(
     return rows[0].get("campaign.bidding_strategy_type")
 
 
-def _ad_group_uses_manual_cpc(
+def _existing_negative_geo_exclusions(
+    config: AdLoopConfig, customer_id: str, campaign_id: str
+) -> list[str]:
+    """Return geo_target_constant IDs that are currently negative-excluded.
+
+    Used by ``update_campaign`` to surface preserved negative-location
+    criteria in the preview when ``geo_target_ids`` is being changed.
+    Negative location criteria survive a positive-geo replacement (issue
+    #32) — this helper makes that explicit in the preview so users can
+    see what's staying. Returns an empty list on any query failure;
+    surfacing exclusions is informational, not safety-critical.
+    """
+    from adloop.ads.gaql import execute_query
+
+    query = f"""
+        SELECT campaign_criterion.location.geo_target_constant
+        FROM campaign_criterion
+        WHERE campaign.id = {campaign_id}
+          AND campaign_criterion.type = 'LOCATION'
+          AND campaign_criterion.negative = TRUE
+    """
+    try:
+        rows = execute_query(config, customer_id, query)
+    except Exception:
+        return []
+
+    ids: list[str] = []
+    for row in rows:
+        gtc = row.get("campaign_criterion.location.geo_target_constant") or ""
+        # gtc looks like "geoTargetConstants/2840" — strip prefix to numeric ID.
+        if "/" in gtc:
+            ids.append(gtc.rsplit("/", 1)[-1])
+        elif gtc:
+            ids.append(gtc)
+    return ids
+
+
+def _ad_group_campaign_bidding_strategy(
     config: AdLoopConfig, customer_id: str, ad_group_id: str
-) -> bool | None:
-    """Return True when the ad group exists in a MANUAL_CPC campaign."""
+) -> str | None:
+    """Return the bidding strategy type of the campaign owning this ad group.
+
+    Returns the enum name (``MANUAL_CPC``, ``TARGET_SPEND``,
+    ``MAXIMIZE_CONVERSIONS``, ``TARGET_CPA``, ``TARGET_ROAS``, etc.) or
+    ``None`` when the ad group can't be resolved.
+    """
     from adloop.ads.gaql import execute_query
 
     query = f"""
@@ -1514,7 +1604,7 @@ def _ad_group_uses_manual_cpc(
     rows = execute_query(config, customer_id, query)
     if not rows:
         return None
-    return rows[0].get("campaign.bidding_strategy_type") == "MANUAL_CPC"
+    return rows[0].get("campaign.bidding_strategy_type")
 
 
 def _validate_callouts(
@@ -2395,16 +2485,25 @@ def _apply_update_campaign(client: object, cid: str, changes: dict) -> dict:
         )
         operations.append(budget_op)
 
-    # Geo targeting — remove existing, add new
+    # Geo targeting — replace POSITIVE location criteria, preserve NEGATIVE
+    # location exclusions. The previous implementation filtered on
+    # campaign_criterion.type = 'LOCATION' alone, which swept up negative
+    # exclusions (e.g. excluding the USA from a worldwide campaign) and
+    # silently removed them when the user added or swapped a positive geo.
+    # That's a data-safety bug — users wouldn't notice the exclusion was
+    # gone until traffic from the excluded region started showing up in
+    # reports (issue #32). Restrict the removal scope with
+    # ``campaign_criterion.negative = FALSE`` so negatives survive.
     geo_ids = changes.get("geo_target_ids")
     if geo_ids is not None:
-        existing_geo = f"""
+        existing_positive_geo = f"""
             SELECT campaign_criterion.resource_name
             FROM campaign_criterion
             WHERE campaign.id = {campaign_id}
               AND campaign_criterion.type = 'LOCATION'
+              AND campaign_criterion.negative = FALSE
         """
-        for row in service.search(customer_id=cid, query=existing_geo):
+        for row in service.search(customer_id=cid, query=existing_positive_geo):
             rm_op = client.get_type("MutateOperation")
             rm_op.campaign_criterion_operation.remove = (
                 row.campaign_criterion.resource_name
