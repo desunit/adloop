@@ -98,30 +98,43 @@ def estimate_budget(
     response = kp_service.generate_keyword_forecast_metrics(request=request)
     metrics = response.campaign_forecast_metrics
 
+    # KeywordForecastMetrics fields are ``optional`` in v23, so the SDK
+    # returns ``None`` for unset fields and the actual integer (including
+    # 0) otherwise. Falsy checks like ``int(v) if v else None`` would
+    # silently map a real 0-click or 0-cost forecast to None and the
+    # caller couldn't tell "no data" apart from "data says zero" — same
+    # bug class as discover_keywords (issue Bug 2). Use ``is not None``
+    # throughout and the shared ``_micros_to_currency`` helper for the
+    # micros→currency conversions.
     clicks = getattr(metrics, "clicks", None)
     impressions = getattr(metrics, "impressions", None)
     avg_cpc_micros = getattr(metrics, "average_cpc_micros", None)
     cost_micros = getattr(metrics, "cost_micros", None)
     ctr = getattr(metrics, "click_through_rate", None)
 
-    total_cost = round(cost_micros / 1_000_000, 2) if cost_micros else None
-    avg_cpc = round(avg_cpc_micros / 1_000_000, 2) if avg_cpc_micros else None
+    total_cost = _micros_to_currency(cost_micros)
+    avg_cpc = _micros_to_currency(avg_cpc_micros)
 
     days = max(forecast_days, 1)
     daily = {
-        "clicks": round(clicks / days, 1) if clicks else None,
-        "impressions": round(impressions / days, 1) if impressions else None,
-        "cost": round(total_cost / days, 2) if total_cost else None,
+        "clicks": round(clicks / days, 1) if clicks is not None else None,
+        "impressions": (
+            round(impressions / days, 1) if impressions is not None else None
+        ),
+        "cost": round(total_cost / days, 2) if total_cost is not None else None,
     }
 
     insights = []
+    # Only emit the headline insight when there's actually something to
+    # report (real clicks AND real cost) — a zero-click forecast gets its
+    # own dedicated insight below, and a None forecast shouldn't trigger
+    # either path.
     if total_cost is not None and clicks is not None and clicks > 0:
-        effective_cpa_budget = total_cost / clicks * 10
         insights.append(
             f"Estimated {clicks:.0f} clicks over {forecast_days} days at "
             f"~{avg_cpc} avg CPC. Total estimated cost: {total_cost:.2f}."
         )
-    if daily_budget > 0 and daily["cost"] is not None:
+    if daily_budget > 0 and daily["cost"] is not None and daily["cost"] > 0:
         if daily_budget < daily["cost"]:
             capture_pct = round(daily_budget / daily["cost"] * 100)
             insights.append(
@@ -134,7 +147,12 @@ def estimate_budget(
                 f"most available traffic (estimated daily cost: {daily['cost']:.2f})."
             )
 
-    if impressions is not None and clicks is not None and impressions > 0 and clicks == 0:
+    if (
+        impressions is not None
+        and clicks is not None
+        and impressions > 0
+        and clicks == 0
+    ):
         insights.append(
             "Forecast shows impressions but zero clicks — keywords may be too "
             "generic or CPCs too low for competitive positions."
@@ -149,7 +167,7 @@ def estimate_budget(
         "estimated_impressions": impressions,
         "estimated_cost": total_cost,
         "estimated_avg_cpc": avg_cpc,
-        "estimated_ctr": round(ctr, 4) if ctr else None,
+        "estimated_ctr": round(ctr, 4) if ctr is not None else None,
         "daily_estimates": daily,
         "keywords_used": len([kw for kw in keywords if kw.get("text")]),
         "insights": insights,

@@ -487,6 +487,178 @@ class TestKeywordIdeasRestBody:
         assert body["pageToken"] == "next-page-123"
 
 
+class TestEstimateBudgetZeroPreservation:
+    """Regression suite for Bug 2 — ``estimate_budget`` used the same falsy
+    pattern as ``discover_keywords`` (``int(v) if v else None`` and
+    ``round(x) if x else None``), which silently mapped a legitimate 0-click,
+    0-cost, or 0-CTR forecast onto ``None``. The caller couldn't tell "no
+    data returned" apart from "Google says zero" — which matters because a
+    real zero-cost / zero-click forecast is itself the diagnostic signal
+    ("your keywords have impressions but no clicks", "the daily budget can
+    cover 100% of estimated cost"). These tests pin the fix end-to-end and
+    will fail if anyone re-introduces a falsy guard on these fields.
+    """
+
+    def _fake_client(self, metrics_obj):
+        """Build a fake Google Ads client whose
+        ``KeywordPlanIdeaService.generate_keyword_forecast_metrics`` returns
+        the given ``metrics_obj`` as the ``campaign_forecast_metrics``.
+
+        The wrapper apes the bits of the SDK that ``estimate_budget``
+        actually touches: ``get_service``, ``get_type``, ``enums``, and the
+        path builder methods. Nothing about the proto plumbing is
+        exercised — that belongs in google-ads-python's own tests, not ours.
+        """
+        forecast_metrics_response = SimpleNamespace(
+            campaign_forecast_metrics=metrics_obj
+        )
+
+        kp_service = SimpleNamespace(
+            generate_keyword_forecast_metrics=lambda request=None: (
+                forecast_metrics_response
+            )
+        )
+        googleads_service = SimpleNamespace(
+            geo_target_constant_path=lambda gid: f"geoTargetConstants/{gid}",
+            language_constant_path=lambda lid: f"languageConstants/{lid}",
+        )
+
+        def _get_service(name):
+            return {
+                "KeywordPlanIdeaService": kp_service,
+                "GoogleAdsService": googleads_service,
+            }[name]
+
+        # Each ``get_type`` call returns a fresh SimpleNamespace-ish object
+        # so the function can assign attributes on it freely. We don't
+        # validate what gets assigned — the proto wrapping is google-ads-
+        # python's job — we just need attribute writes not to explode.
+        def _get_type(_name):
+            return SimpleNamespace(
+                geo_modifiers=[],
+                language_constants=[],
+                ad_groups=[],
+                biddable_keywords=[],
+                keyword=SimpleNamespace(),
+                bidding_strategy=SimpleNamespace(
+                    manual_cpc_bidding_strategy=SimpleNamespace()
+                ),
+                forecast_period=SimpleNamespace(),
+            )
+
+        enums = SimpleNamespace(
+            KeywordPlanNetworkEnum=SimpleNamespace(GOOGLE_SEARCH="GOOGLE_SEARCH"),
+            KeywordMatchTypeEnum=SimpleNamespace(
+                EXACT="EXACT", PHRASE="PHRASE", BROAD="BROAD"
+            ),
+        )
+
+        return SimpleNamespace(
+            get_service=_get_service,
+            get_type=_get_type,
+            enums=enums,
+        )
+
+    def _run(self, config, monkeypatch, metrics_obj):
+        monkeypatch.setattr(
+            forecast,
+            "get_ads_client",
+            lambda _cfg: self._fake_client(metrics_obj),
+            raising=False,
+        )
+        # ``get_ads_client`` and ``normalize_customer_id`` are imported
+        # inside the function body, so we have to patch them on the source
+        # module (the same trick used for ``get_ads_credentials`` in
+        # TestRestRateLimitRetry). Patching ``forecast.get_ads_client``
+        # would be a no-op.
+        import adloop.ads.client as _client_mod
+
+        monkeypatch.setattr(
+            _client_mod, "get_ads_client", lambda _cfg: self._fake_client(metrics_obj)
+        )
+        monkeypatch.setattr(
+            _client_mod, "normalize_customer_id", lambda cid: cid.replace("-", "")
+        )
+
+        return forecast.estimate_budget(
+            config,
+            keywords=[{"text": "test kw", "match_type": "EXACT", "max_cpc": 1.0}],
+            daily_budget=10.0,
+            forecast_days=30,
+        )
+
+    def test_zero_clicks_preserved_not_nulled(self, config, monkeypatch):
+        # The diagnostic insight "impressions but zero clicks" depends on
+        # clicks being a literal 0, not None. If this regresses, the
+        # insight silently stops firing.
+        metrics = SimpleNamespace(
+            clicks=0,
+            impressions=1000,
+            average_cpc_micros=None,
+            cost_micros=0,
+            click_through_rate=0.0,
+        )
+        result = self._run(config, monkeypatch, metrics)
+        assert result["estimated_clicks"] == 0
+        assert result["estimated_impressions"] == 1000
+        assert result["estimated_cost"] == 0.0
+        assert result["estimated_ctr"] == 0.0
+        # The "zero clicks despite impressions" insight should fire.
+        assert any("zero clicks" in i for i in result["insights"])
+
+    def test_zero_cost_preserved_not_nulled(self, config, monkeypatch):
+        metrics = SimpleNamespace(
+            clicks=10,
+            impressions=100,
+            average_cpc_micros=0,
+            cost_micros=0,
+            click_through_rate=0.1,
+        )
+        result = self._run(config, monkeypatch, metrics)
+        assert result["estimated_cost"] == 0.0
+        assert result["estimated_avg_cpc"] == 0.0
+        # ``daily_estimates.cost`` must round-trip 0.0, not None.
+        assert result["daily_estimates"]["cost"] == 0.0
+
+    def test_none_metrics_remain_none(self, config, monkeypatch):
+        # Forecast service can legitimately return None for unset optional
+        # fields. We must NOT coerce those to 0 (the opposite bug class).
+        metrics = SimpleNamespace(
+            clicks=None,
+            impressions=None,
+            average_cpc_micros=None,
+            cost_micros=None,
+            click_through_rate=None,
+        )
+        result = self._run(config, monkeypatch, metrics)
+        assert result["estimated_clicks"] is None
+        assert result["estimated_impressions"] is None
+        assert result["estimated_cost"] is None
+        assert result["estimated_avg_cpc"] is None
+        assert result["estimated_ctr"] is None
+        assert result["daily_estimates"]["clicks"] is None
+        assert result["daily_estimates"]["impressions"] is None
+        assert result["daily_estimates"]["cost"] is None
+
+    def test_realistic_forecast_still_works(self, config, monkeypatch):
+        # Sanity check that the fix didn't break the normal happy path —
+        # non-zero numbers still flow through and the headline insight
+        # still fires.
+        metrics = SimpleNamespace(
+            clicks=300,
+            impressions=10_000,
+            average_cpc_micros=500_000,  # 0.50
+            cost_micros=150_000_000,     # 150.00
+            click_through_rate=0.03,
+        )
+        result = self._run(config, monkeypatch, metrics)
+        assert result["estimated_clicks"] == 300
+        assert result["estimated_cost"] == 150.0
+        assert result["estimated_avg_cpc"] == 0.5
+        assert result["estimated_ctr"] == 0.03
+        assert any("Estimated 300 clicks" in i for i in result["insights"])
+
+
 class TestRestRateLimitRetry:
     """When the REST endpoint returns 429, surface a RESOURCE_EXHAUSTED error
     string so the existing ``call_with_retry`` helper backs off and re-tries.
