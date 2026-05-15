@@ -159,6 +159,90 @@ def estimate_budget(
 _COMPETITION_LABELS = {0: "UNSPECIFIED", 1: "LOW", 2: "MEDIUM", 3: "HIGH"}
 
 
+_KEYWORD_IDEAS_REST_URL = (
+    "https://googleads.googleapis.com/{version}/customers/{cid}:generateKeywordIdeas"
+)
+
+
+def _build_keyword_ideas_rest_body(
+    *,
+    language_id: str,
+    geo_target_id: str,
+    page_size: int,
+    seed_keywords: list[str],
+    url: str,
+    page_token: str = "",
+) -> dict:
+    """Build the JSON body for the REST generateKeywordIdeas endpoint.
+
+    Schema follows google-ads REST v23 (camelCase). Exactly one of
+    ``keywordSeed`` / ``urlSeed`` / ``keywordAndUrlSeed`` is set based on
+    which inputs were provided.
+    """
+    body: dict = {
+        "language": f"languageConstants/{language_id}",
+        "geoTargetConstants": [f"geoTargetConstants/{geo_target_id}"],
+        "keywordPlanNetwork": "GOOGLE_SEARCH",
+        "pageSize": page_size,
+    }
+    if seed_keywords and url:
+        body["keywordAndUrlSeed"] = {"url": url, "keywords": list(seed_keywords)}
+    elif seed_keywords:
+        body["keywordSeed"] = {"keywords": list(seed_keywords)}
+    else:
+        body["urlSeed"] = {"url": url}
+    if page_token:
+        body["pageToken"] = page_token
+    return body
+
+
+def _post_keyword_ideas_rest_page(
+    config: AdLoopConfig, cid: str, body: dict
+) -> dict:
+    """POST a single page request to the REST generateKeywordIdeas endpoint.
+
+    Issue #37: ``KeywordPlanIdeaService.GenerateKeywordIdeas`` over gRPC sits
+    in a tight quota bucket that exhausts after a small number of sequential
+    calls and returns ``RESOURCE_EXHAUSTED`` regardless of QPS. The REST v23
+    endpoint for the same method lives in a separate, much larger quota
+    bucket, so this swap eliminates the 429s that made ``discover_keywords``
+    unusable for any multi-geo or repeat-call workflow. Filed against
+    google-ads-python; see https://github.com/kLOsk/adloop/issues/37.
+
+    Re-raises HTTP 429s as a string-formatted error so the existing
+    ``call_with_retry`` helper can apply exponential backoff and re-attempt.
+    """
+    import requests
+    from google.auth.transport.requests import AuthorizedSession
+
+    from adloop.ads.client import GOOGLE_ADS_API_VERSION
+    from adloop.auth import get_ads_credentials
+
+    credentials = get_ads_credentials(config)
+    session = AuthorizedSession(credentials)
+
+    headers = {
+        "developer-token": config.ads.developer_token,
+        "Content-Type": "application/json",
+    }
+    if config.ads.login_customer_id:
+        headers["login-customer-id"] = config.ads.login_customer_id.replace("-", "")
+
+    url = _KEYWORD_IDEAS_REST_URL.format(version=GOOGLE_ADS_API_VERSION, cid=cid)
+    response = session.post(url, json=body, headers=headers, timeout=60)
+
+    if response.status_code == 429:
+        # Surface as a RESOURCE_EXHAUSTED string so call_with_retry recognises
+        # this as a rate-limit error and backs off. The REST bucket is much
+        # larger than gRPC so this branch should be rare, but handle it.
+        raise requests.HTTPError(
+            f"RESOURCE_EXHAUSTED (HTTP 429) from REST generateKeywordIdeas: "
+            f"{response.text[:500]}"
+        )
+    response.raise_for_status()
+    return response.json()
+
+
 def discover_keywords(
     config: AdLoopConfig,
     *,
@@ -184,57 +268,68 @@ def discover_keywords(
     geo_target_id: geo target constant (2276=Germany, 2840=USA, 2826=UK)
     language_id: language constant (1000=English, 1001=German, 1002=French)
     page_size: max number of keyword ideas to return (default 50, max 1000)
+
+    Network: this tool intentionally bypasses the google-ads gRPC client for
+    KeywordPlanIdeaService and calls the v23 REST endpoint directly. The
+    gRPC quota bucket for this single method exhausts almost immediately
+    under sequential single-geo calls (issue #37); REST sits in a separate,
+    much larger bucket and works without issue. All other Ads tools still
+    use the gRPC client.
     """
-    from adloop.ads.client import call_with_retry, get_ads_client, normalize_customer_id
+    from adloop.ads.client import call_with_retry, normalize_customer_id
 
     seed_keywords = list(seed_keywords)
     if not seed_keywords and not url:
         return {"error": "Provide at least one of: seed_keywords or url"}
 
-    client = get_ads_client(config)
     cid = normalize_customer_id(customer_id or config.ads.customer_id)
-    googleads_service = client.get_service("GoogleAdsService")
-    kp_service = client.get_service("KeywordPlanIdeaService")
+    capped_page_size = min(max(1, page_size), 1000)
 
-    request = client.get_type("GenerateKeywordIdeasRequest")
-    request.customer_id = cid
-    request.language = googleads_service.language_constant_path(language_id)
-    request.geo_target_constants.append(
-        googleads_service.geo_target_constant_path(geo_target_id)
-    )
-    request.keyword_plan_network = (
-        client.enums.KeywordPlanNetworkEnum.GOOGLE_SEARCH
-    )
-    request.page_size = min(max(1, page_size), 1000)
+    ideas: list[dict] = []
+    page_token = ""
+    while True:
+        body = _build_keyword_ideas_rest_body(
+            language_id=language_id,
+            geo_target_id=geo_target_id,
+            page_size=capped_page_size,
+            seed_keywords=seed_keywords,
+            url=url,
+            page_token=page_token,
+        )
+        payload = call_with_retry(_post_keyword_ideas_rest_page, config, cid, body)
 
-    if seed_keywords and url:
-        request.keyword_and_url_seed.url = url
-        request.keyword_and_url_seed.keywords.extend(seed_keywords)
-    elif seed_keywords:
-        request.keyword_seed.keywords.extend(seed_keywords)
-    else:
-        request.url_seed.url = url
+        for idea in payload.get("results", []):
+            metrics = idea.get("keywordIdeaMetrics", {}) or {}
+            avg_monthly = metrics.get("avgMonthlySearches")
+            competition = metrics.get("competition") or "UNSPECIFIED"
+            competition_index = metrics.get("competitionIndex")
+            low_bid_micros = metrics.get("lowTopOfPageBidMicros")
+            high_bid_micros = metrics.get("highTopOfPageBidMicros")
 
-    response = call_with_retry(kp_service.generate_keyword_ideas, request=request)
+            # int64 fields come back as JSON strings in REST — normalize.
+            avg_monthly_int = int(avg_monthly) if avg_monthly else None
+            competition_index_int = (
+                int(competition_index) if competition_index else None
+            )
+            low_bid_int = int(low_bid_micros) if low_bid_micros else None
+            high_bid_int = int(high_bid_micros) if high_bid_micros else None
 
-    ideas = []
-    for idea in response:
-        metrics = idea.keyword_idea_metrics
-        avg_monthly = getattr(metrics, "avg_monthly_searches", None)
-        competition_value = getattr(metrics, "competition", 0)
-        competition_label = _COMPETITION_LABELS.get(int(competition_value), "UNSPECIFIED")
-        competition_index = getattr(metrics, "competition_index", None)
-        low_bid_micros = getattr(metrics, "low_top_of_page_bid_micros", None)
-        high_bid_micros = getattr(metrics, "high_top_of_page_bid_micros", None)
+            ideas.append({
+                "keyword": idea.get("text", ""),
+                "avg_monthly_searches": avg_monthly_int,
+                "competition": competition,
+                "competition_index": competition_index_int,
+                "low_top_of_page_bid": (
+                    round(low_bid_int / 1_000_000, 2) if low_bid_int else None
+                ),
+                "high_top_of_page_bid": (
+                    round(high_bid_int / 1_000_000, 2) if high_bid_int else None
+                ),
+            })
 
-        ideas.append({
-            "keyword": idea.text,
-            "avg_monthly_searches": int(avg_monthly) if avg_monthly else None,
-            "competition": competition_label,
-            "competition_index": int(competition_index) if competition_index else None,
-            "low_top_of_page_bid": round(low_bid_micros / 1_000_000, 2) if low_bid_micros else None,
-            "high_top_of_page_bid": round(high_bid_micros / 1_000_000, 2) if high_bid_micros else None,
-        })
+        page_token = payload.get("nextPageToken") or ""
+        if not page_token:
+            break
 
     # Sort by avg monthly searches descending (None last)
     ideas.sort(key=lambda x: x["avg_monthly_searches"] or 0, reverse=True)

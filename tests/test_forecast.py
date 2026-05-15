@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,142 +20,234 @@ def config() -> AdLoopConfig:
     )
 
 
-def _make_idea(text, avg_monthly, competition_value, competition_index, low_bid, high_bid):
-    """Build a fake keyword idea proto-like object."""
-    metrics = SimpleNamespace(
-        avg_monthly_searches=avg_monthly,
-        competition=competition_value,
-        competition_index=competition_index,
-        low_top_of_page_bid_micros=low_bid,
-        high_top_of_page_bid_micros=high_bid,
-    )
-    return SimpleNamespace(text=text, keyword_idea_metrics=metrics)
+def _rest_idea(
+    text: str,
+    *,
+    avg_monthly: int | None,
+    competition: str,
+    competition_index: int | None = None,
+    low_bid_micros: int | None = None,
+    high_bid_micros: int | None = None,
+) -> dict:
+    """Build a REST-shape keyword idea entry.
+
+    Mirrors the v23 generateKeywordIdeas JSON response — int64 fields come
+    back as strings, ``competition`` is the enum name (not a numeric code).
+    """
+    metrics: dict = {"competition": competition}
+    if avg_monthly is not None:
+        metrics["avgMonthlySearches"] = str(avg_monthly)
+    if competition_index is not None:
+        metrics["competitionIndex"] = str(competition_index)
+    if low_bid_micros is not None:
+        metrics["lowTopOfPageBidMicros"] = str(low_bid_micros)
+    if high_bid_micros is not None:
+        metrics["highTopOfPageBidMicros"] = str(high_bid_micros)
+    return {"text": text, "keywordIdeaMetrics": metrics}
+
+
+def _patch_rest(payload, monkeypatch):
+    """Replace ``_post_keyword_ideas_rest_page`` with a recording fake.
+
+    Returns (calls, fake). ``payload`` may be a single dict (returned every
+    call) or a list of dicts (consumed one per page in order).
+    """
+    calls: list[dict] = []
+    if isinstance(payload, list):
+        responses = list(payload)
+
+        def _fake(_config, _cid, body):
+            calls.append(body)
+            return responses.pop(0) if responses else {"results": []}
+    else:
+
+        def _fake(_config, _cid, body):
+            calls.append(body)
+            return payload
+
+    monkeypatch.setattr(forecast, "_post_keyword_ideas_rest_page", _fake)
+    return calls
 
 
 class TestDiscoverKeywords:
+    """REST-path tests for issue #37 — `discover_keywords` calls the v23 REST
+    `generateKeywordIdeas` endpoint directly, bypassing the gRPC quota bucket
+    that exhausts after a small number of sequential calls.
+    """
+
     def test_requires_seed_keywords_or_url(self, config):
         result = forecast.discover_keywords(config)
         assert result["error"] == "Provide at least one of: seed_keywords or url"
 
-    def test_seed_keywords_only_uses_keyword_seed(self, config):
-        fake_idea = _make_idea("trail running shoes", 5000, 2, 60, 800_000, 2_000_000)
+    def test_seed_keywords_only_sends_keyword_seed(self, config, monkeypatch):
+        calls = _patch_rest(
+            {
+                "results": [
+                    _rest_idea(
+                        "trail running shoes",
+                        avg_monthly=5000,
+                        competition="MEDIUM",
+                        competition_index=60,
+                        low_bid_micros=800_000,
+                        high_bid_micros=2_000_000,
+                    )
+                ]
+            },
+            monkeypatch,
+        )
 
-        with patch("adloop.ads.client.get_ads_client") as mock_client_fn:
-            client = MagicMock()
-            mock_client_fn.return_value = client
-
-            # configure resource-path helpers
-            gs = MagicMock()
-            gs.language_constant_path.return_value = "languageConstants/1000"
-            gs.geo_target_constant_path.return_value = "geoTargetConstants/2276"
-            client.get_service.side_effect = lambda name: gs if name == "GoogleAdsService" else MagicMock(generate_keyword_ideas=MagicMock(return_value=[fake_idea]))
-
-            request_obj = MagicMock()
-            client.get_type.return_value = request_obj
-
-            result = forecast.discover_keywords(
-                config,
-                seed_keywords=["trail running"],
-                geo_target_id="2276",
-                language_id="1000",
-            )
+        result = forecast.discover_keywords(
+            config,
+            seed_keywords=["trail running"],
+            geo_target_id="2276",
+            language_id="1000",
+        )
 
         assert result["total_ideas"] == 1
-        assert result["keyword_ideas"][0]["keyword"] == "trail running shoes"
-        assert result["keyword_ideas"][0]["competition"] == "MEDIUM"
-        assert result["keyword_ideas"][0]["avg_monthly_searches"] == 5000
-        assert result["keyword_ideas"][0]["low_top_of_page_bid"] == 0.80
-        assert result["keyword_ideas"][0]["high_top_of_page_bid"] == 2.00
-        assert result["seed_keywords"] == ["trail running"]
-        assert result["seed_url"] == ""
+        idea = result["keyword_ideas"][0]
+        assert idea["keyword"] == "trail running shoes"
+        assert idea["competition"] == "MEDIUM"
+        assert idea["avg_monthly_searches"] == 5000
+        assert idea["low_top_of_page_bid"] == 0.80
+        assert idea["high_top_of_page_bid"] == 2.00
 
-    def test_url_only_uses_url_seed(self, config):
-        fake_idea = _make_idea("running gear", 1200, 1, 20, 400_000, 900_000)
+        body = calls[0]
+        assert body["keywordSeed"] == {"keywords": ["trail running"]}
+        assert "urlSeed" not in body and "keywordAndUrlSeed" not in body
+        assert body["geoTargetConstants"] == ["geoTargetConstants/2276"]
+        assert body["language"] == "languageConstants/1000"
+        assert body["keywordPlanNetwork"] == "GOOGLE_SEARCH"
 
-        with patch("adloop.ads.client.get_ads_client") as mock_client_fn:
-            client = MagicMock()
-            mock_client_fn.return_value = client
+    def test_url_only_sends_url_seed(self, config, monkeypatch):
+        calls = _patch_rest(
+            {
+                "results": [
+                    _rest_idea(
+                        "running gear",
+                        avg_monthly=1200,
+                        competition="LOW",
+                        competition_index=20,
+                        low_bid_micros=400_000,
+                        high_bid_micros=900_000,
+                    )
+                ]
+            },
+            monkeypatch,
+        )
 
-            gs = MagicMock()
-            gs.language_constant_path.return_value = "languageConstants/1000"
-            gs.geo_target_constant_path.return_value = "geoTargetConstants/2840"
-            client.get_service.side_effect = lambda name: gs if name == "GoogleAdsService" else MagicMock(generate_keyword_ideas=MagicMock(return_value=[fake_idea]))
-
-            request_obj = MagicMock()
-            client.get_type.return_value = request_obj
-
-            result = forecast.discover_keywords(
-                config,
-                url="https://example.com/running",
-                geo_target_id="2840",
-                language_id="1000",
-            )
+        result = forecast.discover_keywords(
+            config,
+            url="https://example.com/running",
+            geo_target_id="2840",
+            language_id="1000",
+        )
 
         assert result["total_ideas"] == 1
         assert result["keyword_ideas"][0]["competition"] == "LOW"
         assert result["seed_url"] == "https://example.com/running"
         assert result["seed_keywords"] == []
 
-    def test_ideas_sorted_by_avg_monthly_searches_descending(self, config):
-        ideas = [
-            _make_idea("low volume", 100, 1, 10, None, None),
-            _make_idea("high volume", 50000, 3, 90, 1_000_000, 3_000_000),
-            _make_idea("mid volume", 5000, 2, 50, 500_000, 1_500_000),
-        ]
+        body = calls[0]
+        assert body["urlSeed"] == {"url": "https://example.com/running"}
+        assert "keywordSeed" not in body and "keywordAndUrlSeed" not in body
 
-        with patch("adloop.ads.client.get_ads_client") as mock_client_fn:
-            client = MagicMock()
-            mock_client_fn.return_value = client
+    def test_keyword_and_url_sends_combined_seed(self, config, monkeypatch):
+        calls = _patch_rest({"results": []}, monkeypatch)
 
-            gs = MagicMock()
-            gs.language_constant_path.return_value = "languageConstants/1000"
-            gs.geo_target_constant_path.return_value = "geoTargetConstants/2276"
-            client.get_service.side_effect = lambda name: gs if name == "GoogleAdsService" else MagicMock(generate_keyword_ideas=MagicMock(return_value=ideas))
-            client.get_type.return_value = MagicMock()
+        forecast.discover_keywords(
+            config,
+            seed_keywords=["a", "b"],
+            url="https://example.com",
+        )
 
-            result = forecast.discover_keywords(config, seed_keywords=["running"])
+        body = calls[0]
+        assert body["keywordAndUrlSeed"] == {
+            "url": "https://example.com",
+            "keywords": ["a", "b"],
+        }
+        assert "keywordSeed" not in body and "urlSeed" not in body
 
+    def test_ideas_sorted_by_avg_monthly_searches_descending(self, config, monkeypatch):
+        _patch_rest(
+            {
+                "results": [
+                    _rest_idea("low volume", avg_monthly=100, competition="LOW"),
+                    _rest_idea(
+                        "high volume",
+                        avg_monthly=50000,
+                        competition="HIGH",
+                        low_bid_micros=1_000_000,
+                        high_bid_micros=3_000_000,
+                    ),
+                    _rest_idea(
+                        "mid volume",
+                        avg_monthly=5000,
+                        competition="MEDIUM",
+                        low_bid_micros=500_000,
+                        high_bid_micros=1_500_000,
+                    ),
+                ]
+            },
+            monkeypatch,
+        )
+
+        result = forecast.discover_keywords(config, seed_keywords=["running"])
         volumes = [i["avg_monthly_searches"] for i in result["keyword_ideas"]]
         assert volumes == sorted(volumes, reverse=True)
 
-    def test_insights_surface_competition_breakdown(self, config):
-        ideas = [
-            _make_idea("cheap option", 200, 1, 15, None, None),
-            _make_idea("popular term", 8000, 3, 85, 2_000_000, 5_000_000),
-        ]
+    def test_insights_surface_competition_breakdown(self, config, monkeypatch):
+        _patch_rest(
+            {
+                "results": [
+                    _rest_idea("cheap option", avg_monthly=200, competition="LOW"),
+                    _rest_idea(
+                        "popular term",
+                        avg_monthly=8000,
+                        competition="HIGH",
+                        low_bid_micros=2_000_000,
+                        high_bid_micros=5_000_000,
+                    ),
+                ]
+            },
+            monkeypatch,
+        )
 
-        with patch("adloop.ads.client.get_ads_client") as mock_client_fn:
-            client = MagicMock()
-            mock_client_fn.return_value = client
-
-            gs = MagicMock()
-            gs.language_constant_path.return_value = "languageConstants/1000"
-            gs.geo_target_constant_path.return_value = "geoTargetConstants/2276"
-            client.get_service.side_effect = lambda name: gs if name == "GoogleAdsService" else MagicMock(generate_keyword_ideas=MagicMock(return_value=ideas))
-            client.get_type.return_value = MagicMock()
-
-            result = forecast.discover_keywords(config, seed_keywords=["option"])
-
+        result = forecast.discover_keywords(config, seed_keywords=["option"])
         assert any("high-competition" in i for i in result["insights"])
         assert any("low-competition" in i for i in result["insights"])
 
-    def test_page_size_capped_at_1000(self, config):
-        with patch("adloop.ads.client.get_ads_client") as mock_client_fn:
-            client = MagicMock()
-            mock_client_fn.return_value = client
+    def test_page_size_capped_at_1000(self, config, monkeypatch):
+        calls = _patch_rest({"results": []}, monkeypatch)
 
-            gs = MagicMock()
-            gs.language_constant_path.return_value = "languageConstants/1000"
-            gs.geo_target_constant_path.return_value = "geoTargetConstants/2276"
-            kp = MagicMock(generate_keyword_ideas=MagicMock(return_value=[]))
-            client.get_service.side_effect = lambda name: gs if name == "GoogleAdsService" else kp
+        forecast.discover_keywords(config, seed_keywords=["test"], page_size=9999)
 
-            request_obj = MagicMock()
-            client.get_type.return_value = request_obj
+        assert calls[0]["pageSize"] == 1000
 
-            forecast.discover_keywords(config, seed_keywords=["test"], page_size=9999)
+    def test_pagination_concatenates_all_pages(self, config, monkeypatch):
+        """next_page_token in the response means we keep paging until empty."""
+        calls = _patch_rest(
+            [
+                {
+                    "results": [
+                        _rest_idea("kw1", avg_monthly=100, competition="LOW")
+                    ],
+                    "nextPageToken": "page2",
+                },
+                {
+                    "results": [
+                        _rest_idea("kw2", avg_monthly=200, competition="LOW")
+                    ],
+                },
+            ],
+            monkeypatch,
+        )
 
-        assert request_obj.page_size == 1000
+        result = forecast.discover_keywords(config, seed_keywords=["test"])
+
+        assert result["total_ideas"] == 2
+        assert len(calls) == 2
+        assert "pageToken" not in calls[0]
+        assert calls[1]["pageToken"] == "page2"
 
     def test_empty_seed_keywords_without_url_returns_error(self, config):
         result = forecast.discover_keywords(config, seed_keywords=[])
@@ -168,6 +260,93 @@ class TestDiscoverKeywords:
         default = sig.parameters["seed_keywords"].default
         assert default == []
         assert default is not None
+
+
+class TestKeywordIdeasRestBody:
+    """Direct coverage of the REST body builder — independent of the network."""
+
+    def test_keyword_seed_shape(self):
+        body = forecast._build_keyword_ideas_rest_body(
+            language_id="1000",
+            geo_target_id="2276",
+            page_size=50,
+            seed_keywords=["running shoes"],
+            url="",
+        )
+        assert body["language"] == "languageConstants/1000"
+        assert body["geoTargetConstants"] == ["geoTargetConstants/2276"]
+        assert body["keywordPlanNetwork"] == "GOOGLE_SEARCH"
+        assert body["pageSize"] == 50
+        assert body["keywordSeed"] == {"keywords": ["running shoes"]}
+        assert "urlSeed" not in body
+        assert "keywordAndUrlSeed" not in body
+        assert "pageToken" not in body
+
+    def test_url_seed_shape(self):
+        body = forecast._build_keyword_ideas_rest_body(
+            language_id="1001",
+            geo_target_id="2276",
+            page_size=10,
+            seed_keywords=[],
+            url="https://example.com",
+        )
+        assert body["urlSeed"] == {"url": "https://example.com"}
+        assert "keywordSeed" not in body
+
+    def test_combined_seed_shape(self):
+        body = forecast._build_keyword_ideas_rest_body(
+            language_id="1000",
+            geo_target_id="2840",
+            page_size=25,
+            seed_keywords=["a", "b"],
+            url="https://example.com",
+        )
+        assert body["keywordAndUrlSeed"] == {
+            "url": "https://example.com",
+            "keywords": ["a", "b"],
+        }
+
+    def test_page_token_included_when_present(self):
+        body = forecast._build_keyword_ideas_rest_body(
+            language_id="1000",
+            geo_target_id="2276",
+            page_size=50,
+            seed_keywords=["x"],
+            url="",
+            page_token="next-page-123",
+        )
+        assert body["pageToken"] == "next-page-123"
+
+
+class TestRestRateLimitRetry:
+    """When the REST endpoint returns 429, surface a RESOURCE_EXHAUSTED error
+    string so the existing ``call_with_retry`` helper backs off and re-tries.
+    """
+
+    def test_429_raises_resource_exhausted_string(self, config, monkeypatch):
+        import requests as _requests
+
+        fake_response = SimpleNamespace(
+            status_code=429,
+            text='{"error": {"status": "RESOURCE_EXHAUSTED"}}',
+            raise_for_status=lambda: None,
+            json=lambda: {},
+        )
+        fake_session = SimpleNamespace(post=lambda *_a, **_kw: fake_response)
+
+        monkeypatch.setattr(
+            forecast, "get_ads_credentials", lambda _config: SimpleNamespace(),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "google.auth.transport.requests.AuthorizedSession",
+            lambda _creds: fake_session,
+        )
+
+        with pytest.raises(_requests.HTTPError, match="RESOURCE_EXHAUSTED"):
+            forecast._post_keyword_ideas_rest_page(
+                config, "1234567890", {"keywordSeed": {"keywords": ["x"]}}
+            )
 
 
 class TestCallWithRetry:
