@@ -324,6 +324,12 @@ class TestRestRateLimitRetry:
     """
 
     def test_429_raises_resource_exhausted_string(self, config, monkeypatch):
+        """HTTP 429 from the REST endpoint must be re-raised as a string
+        containing 'RESOURCE_EXHAUSTED' so the shared ``call_with_retry``
+        helper (which detects rate limits by substring match) recognises
+        it and triggers exponential backoff. Without this surface, REST
+        429s would propagate as plain ``HTTPError`` and skip the retry.
+        """
         import requests as _requests
 
         fake_response = SimpleNamespace(
@@ -334,9 +340,14 @@ class TestRestRateLimitRetry:
         )
         fake_session = SimpleNamespace(post=lambda *_a, **_kw: fake_response)
 
+        # Patch the *source* module — the function imports
+        # ``get_ads_credentials`` from ``adloop.auth`` inside its body,
+        # so patching ``forecast.get_ads_credentials`` (a name that
+        # doesn't exist at module scope) would be a no-op and the real
+        # OAuth flow would fire on CI where no cached token exists.
+        import adloop.auth as _auth_mod
         monkeypatch.setattr(
-            forecast, "get_ads_credentials", lambda _config: SimpleNamespace(),
-            raising=False,
+            _auth_mod, "get_ads_credentials", lambda _config: SimpleNamespace(),
         )
         monkeypatch.setattr(
             "google.auth.transport.requests.AuthorizedSession",
