@@ -164,6 +164,40 @@ _KEYWORD_IDEAS_REST_URL = (
 )
 
 
+def _maybe_int(value: object) -> int | None:
+    """Parse a JSON int64 field into an int, preserving legitimate 0.
+
+    REST returns ``int64`` fields as JSON strings per the proto3 JSON spec
+    (e.g. ``"avgMonthlySearches": "0"``). Falsy checks like
+    ``int(v) if v else None`` would map a real ``0`` to ``None`` and
+    silently lose data — e.g. a niche keyword with no recorded competition
+    or a bid range whose low bound is 0 would disappear from the output.
+
+    Treat only ``None`` and empty string as "missing"; everything that
+    parses cleanly as an int (including ``"0"`` and ``0``) is preserved
+    exactly. Anything else falls back to ``None`` rather than crashing
+    the whole response.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _micros_to_currency(micros: int | None) -> float | None:
+    """Convert micros to a 2-dp currency float, preserving ``0`` and ``None``.
+
+    A bid bound of 0 micros is meaningful (Google can return 0 for the low
+    end of a competitive range or when no bid data is available for a
+    keyword) and must not be collapsed to ``None``.
+    """
+    if micros is None:
+        return None
+    return round(micros / 1_000_000, 2)
+
+
 def _build_keyword_ideas_rest_body(
     *,
     language_id: str,
@@ -300,30 +334,22 @@ def discover_keywords(
 
         for idea in payload.get("results", []):
             metrics = idea.get("keywordIdeaMetrics", {}) or {}
-            avg_monthly = metrics.get("avgMonthlySearches")
             competition = metrics.get("competition") or "UNSPECIFIED"
-            competition_index = metrics.get("competitionIndex")
-            low_bid_micros = metrics.get("lowTopOfPageBidMicros")
-            high_bid_micros = metrics.get("highTopOfPageBidMicros")
 
-            # int64 fields come back as JSON strings in REST — normalize.
-            avg_monthly_int = int(avg_monthly) if avg_monthly else None
-            competition_index_int = (
-                int(competition_index) if competition_index else None
-            )
-            low_bid_int = int(low_bid_micros) if low_bid_micros else None
-            high_bid_int = int(high_bid_micros) if high_bid_micros else None
-
+            # REST returns int64 fields as JSON strings; ``_maybe_int`` and
+            # ``_micros_to_currency`` preserve legitimate 0 values that
+            # falsy checks would otherwise silently drop. See the helper
+            # docstrings for the failure modes this defends against.
             ideas.append({
                 "keyword": idea.get("text", ""),
-                "avg_monthly_searches": avg_monthly_int,
+                "avg_monthly_searches": _maybe_int(metrics.get("avgMonthlySearches")),
                 "competition": competition,
-                "competition_index": competition_index_int,
-                "low_top_of_page_bid": (
-                    round(low_bid_int / 1_000_000, 2) if low_bid_int else None
+                "competition_index": _maybe_int(metrics.get("competitionIndex")),
+                "low_top_of_page_bid": _micros_to_currency(
+                    _maybe_int(metrics.get("lowTopOfPageBidMicros"))
                 ),
-                "high_top_of_page_bid": (
-                    round(high_bid_int / 1_000_000, 2) if high_bid_int else None
+                "high_top_of_page_bid": _micros_to_currency(
+                    _maybe_int(metrics.get("highTopOfPageBidMicros"))
                 ),
             })
 

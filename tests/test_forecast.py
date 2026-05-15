@@ -262,6 +262,175 @@ class TestDiscoverKeywords:
         assert default is not None
 
 
+class TestZeroValuePreservation:
+    """REST int64 fields can legitimately be 0 — bid bounds for keywords
+    with no bid data, competition index for terms Google has no signal on,
+    avg monthly searches for ultra-niche queries. The previous code used
+    falsy checks (``int(v) if v else None``) which silently mapped a real
+    ``0`` to ``None`` and lost the value. Cover each path explicitly so
+    a future regression can't reintroduce the falsy-check pattern.
+    """
+
+    def test_zero_low_bid_micros_preserved_as_zero(self, config, monkeypatch):
+        _patch_rest(
+            {
+                "results": [
+                    _rest_idea(
+                        "ultra niche term",
+                        avg_monthly=10,
+                        competition="LOW",
+                        competition_index=1,
+                        low_bid_micros=0,
+                        high_bid_micros=500_000,
+                    )
+                ]
+            },
+            monkeypatch,
+        )
+
+        result = forecast.discover_keywords(config, seed_keywords=["niche"])
+        idea = result["keyword_ideas"][0]
+        assert idea["low_top_of_page_bid"] == 0.0
+        assert idea["low_top_of_page_bid"] is not None
+        assert idea["high_top_of_page_bid"] == 0.50
+
+    def test_zero_high_bid_micros_preserved_as_zero(self, config, monkeypatch):
+        _patch_rest(
+            {
+                "results": [
+                    _rest_idea(
+                        "no bid data term",
+                        avg_monthly=50,
+                        competition="LOW",
+                        low_bid_micros=0,
+                        high_bid_micros=0,
+                    )
+                ]
+            },
+            monkeypatch,
+        )
+
+        idea = forecast.discover_keywords(config, seed_keywords=["x"])[
+            "keyword_ideas"
+        ][0]
+        assert idea["low_top_of_page_bid"] == 0.0
+        assert idea["high_top_of_page_bid"] == 0.0
+        # Sanity check the explicit-None case to make sure we didn't break it.
+        assert all(
+            idea[k] is not None for k in ("low_top_of_page_bid", "high_top_of_page_bid")
+        )
+
+    def test_zero_competition_index_preserved(self, config, monkeypatch):
+        _patch_rest(
+            {
+                "results": [
+                    _rest_idea(
+                        "zero-competition keyword",
+                        avg_monthly=5,
+                        competition="LOW",
+                        competition_index=0,
+                    )
+                ]
+            },
+            monkeypatch,
+        )
+
+        idea = forecast.discover_keywords(config, seed_keywords=["x"])[
+            "keyword_ideas"
+        ][0]
+        assert idea["competition_index"] == 0
+        assert idea["competition_index"] is not None
+
+    def test_zero_avg_monthly_preserved(self, config, monkeypatch):
+        _patch_rest(
+            {
+                "results": [
+                    _rest_idea(
+                        "ultra rare term",
+                        avg_monthly=0,
+                        competition="LOW",
+                    )
+                ]
+            },
+            monkeypatch,
+        )
+
+        idea = forecast.discover_keywords(config, seed_keywords=["x"])[
+            "keyword_ideas"
+        ][0]
+        assert idea["avg_monthly_searches"] == 0
+        assert idea["avg_monthly_searches"] is not None
+
+    def test_missing_fields_still_return_none(self, config, monkeypatch):
+        """Don't over-correct — an absent field is still None, not 0."""
+        _patch_rest(
+            {
+                "results": [
+                    # No metrics at all — every numeric field absent.
+                    {"text": "no data idea", "keywordIdeaMetrics": {}}
+                ]
+            },
+            monkeypatch,
+        )
+
+        idea = forecast.discover_keywords(config, seed_keywords=["x"])[
+            "keyword_ideas"
+        ][0]
+        assert idea["avg_monthly_searches"] is None
+        assert idea["competition_index"] is None
+        assert idea["low_top_of_page_bid"] is None
+        assert idea["high_top_of_page_bid"] is None
+        # competition still defaults to UNSPECIFIED, not None.
+        assert idea["competition"] == "UNSPECIFIED"
+
+
+class TestMaybeIntHelper:
+    """Unit-level coverage for ``_maybe_int`` — the proto3-JSON int64 parser
+    underpinning the zero-value preservation fix above.
+    """
+
+    def test_none_returns_none(self):
+        assert forecast._maybe_int(None) is None
+
+    def test_empty_string_returns_none(self):
+        # Invalid int64 wire format, defensively mapped to None.
+        assert forecast._maybe_int("") is None
+
+    def test_string_zero_returns_zero(self):
+        # The actual bug regression — `"0"` is the wire format REST sends
+        # for a legitimate int64=0 and must round-trip to int 0, not None.
+        assert forecast._maybe_int("0") == 0
+
+    def test_native_zero_returns_zero(self):
+        # Defensive: if a caller ever passes a native int 0, preserve it.
+        assert forecast._maybe_int(0) == 0
+
+    def test_string_positive_int(self):
+        assert forecast._maybe_int("12345") == 12345
+
+    def test_native_positive_int(self):
+        assert forecast._maybe_int(12345) == 12345
+
+    def test_invalid_string_returns_none(self):
+        # Don't crash the whole response on malformed data — just drop the
+        # field. Surfacing the bad value would lock the caller out of every
+        # other valid result on the page.
+        assert forecast._maybe_int("not-a-number") is None
+
+
+class TestMicrosToCurrency:
+    def test_none_returns_none(self):
+        assert forecast._micros_to_currency(None) is None
+
+    def test_zero_returns_zero_not_none(self):
+        # Regression: a bid bound of 0 micros must NOT become None — that's
+        # the original Bug 1 in the released v0.8.0.
+        assert forecast._micros_to_currency(0) == 0.0
+
+    def test_normal_value_rounds_to_two_dp(self):
+        assert forecast._micros_to_currency(1_234_567) == 1.23
+
+
 class TestKeywordIdeasRestBody:
     """Direct coverage of the REST body builder — independent of the network."""
 
