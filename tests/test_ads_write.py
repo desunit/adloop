@@ -24,6 +24,7 @@ class _FakeMutateOperationResponse:
         self.campaign_budget_result = _FakeResult()
         self.campaign_result = _FakeResult()
         self.ad_group_result = _FakeResult()
+        self.ad_group_ad_result = _FakeResult()
         self.campaign_criterion_result = _FakeResult()
         self.asset_result = _FakeResult()
         self.campaign_asset_result = _FakeResult()
@@ -439,6 +440,85 @@ def test_apply_create_app_campaign_builds_app_settings():
     assert results["campaign"] == "customers/1234567890/campaigns/2"
     assert len(results["geo_targets"]) == 1
     assert len(results["language_targets"]) == 1
+
+
+def test_draft_app_ad_rejects_over_limit_text(config, monkeypatch):
+    monkeypatch.setattr(write, "_preflight_app_ad_checks", lambda *_a: ([], []))
+    result = write.draft_app_ad(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        headlines=["x" * 31],
+        descriptions=["ok description"],
+    )
+
+    assert result["error"] == "Validation failed"
+    assert any("Headline 1 is 31 chars" in d for d in result["details"])
+
+
+def test_draft_app_ad_returns_preview(config, monkeypatch):
+    monkeypatch.setattr(write, "_preflight_app_ad_checks", lambda *_a: ([], []))
+    result = write.draft_app_ad(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        headlines=[
+            "Find Any Piano Chord Fast",
+            "Chord Finder & Identifier",
+            "Piano Chords for Beginners",
+            "1500+ Chords & Scales",
+            "Build Chord Progressions",
+        ],
+        descriptions=[
+            "Look up any chord or scale instantly and hear it played on a grand staff.",
+        ],
+    )
+
+    assert result["operation"] == "create_app_ad"
+    assert len(result["changes"]["headlines"]) == 5
+    # 5 headlines -> no headline diversity warning; 1 description -> warn.
+    assert any("description(s) provided" in w for w in result.get("warnings", []))
+
+
+def test_apply_create_app_ad_builds_ad_group_and_app_ad():
+    google_ads_service = _FakeGoogleAdsService(
+        [
+            _FakeMutateOperationResponse(
+                "ad_group_result", "customers/1234567890/adGroups/55"
+            ),
+            _FakeMutateOperationResponse(
+                "ad_group_ad_result", "customers/1234567890/adGroupAds/55~99"
+            ),
+        ]
+    )
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "CampaignService": _FakePathService("campaigns"),
+            "AdGroupService": _FakePathService("adGroups"),
+        }
+    )
+
+    results = write._apply_create_app_ad(
+        client,
+        "1234567890",
+        {
+            "campaign_id": "2",
+            "ad_group_name": "Ad group 1",
+            "headlines": ["Find Any Piano Chord Fast", "1500+ Chords & Scales"],
+            "descriptions": ["Look up any chord instantly."],
+        },
+    )
+
+    ad_group = google_ads_service.operations[0].ad_group_operation.create
+    app_ad = google_ads_service.operations[1].ad_group_ad_operation.create.ad.app_ad
+    assert ad_group.name == "Ad group 1"
+    assert [h.text for h in app_ad.headlines] == [
+        "Find Any Piano Chord Fast",
+        "1500+ Chords & Scales",
+    ]
+    assert [d.text for d in app_ad.descriptions] == ["Look up any chord instantly."]
+    assert results["ad_group_ad"] == "customers/1234567890/adGroupAds/55~99"
 
 
 def test_draft_structured_snippets_rejects_invalid_header(config):

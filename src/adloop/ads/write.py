@@ -1008,6 +1008,71 @@ def draft_app_campaign(
     return preview
 
 
+def draft_app_ad(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    campaign_id: str = "",
+    headlines: list[str] | None = None,
+    descriptions: list[str] | None = None,
+    ad_group_name: str = "",
+) -> dict:
+    """Draft the text assets (App ad) for an App campaign — preview only.
+
+    Creates an ad group + an App ad (AppAdInfo) carrying the text ideas Google
+    rotates across Search/Play/YouTube/Display. App campaigns have no keywords;
+    the headlines (<=30 chars) and descriptions (<=90 chars) plus the store
+    listing ARE the creative. Images/videos are added separately in the UI.
+
+    headlines: 1-5 short text ideas, each <=30 characters.
+    descriptions: 1-5 longer text ideas, each <=90 characters.
+    ad_group_name: optional name for the ad group that holds the ad.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import SafetyViolation, check_blocked_operation
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_app_ad", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    headlines = [h for h in (headlines or []) if h and h.strip()]
+    descriptions = [d for d in (descriptions or []) if d and d.strip()]
+
+    errors, warnings = _validate_app_ad(
+        campaign_id=campaign_id,
+        headlines=headlines,
+        descriptions=descriptions,
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    pf_errors, pf_warnings = _preflight_app_ad_checks(config, customer_id, campaign_id)
+    if pf_errors:
+        return {"error": "Validation failed", "details": pf_errors}
+    warnings.extend(pf_warnings)
+
+    plan = ChangePlan(
+        operation="create_app_ad",
+        entity_type="ad",
+        entity_id=campaign_id,
+        customer_id=customer_id,
+        changes={
+            "campaign_id": campaign_id,
+            "ad_group_name": ad_group_name or "Ad group 1",
+            "headlines": headlines,
+            "descriptions": descriptions,
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    if warnings:
+        preview["warnings"] = warnings
+    return preview
+
+
 def draft_ad_group(
     config: AdLoopConfig,
     *,
@@ -2095,6 +2160,123 @@ def _validate_app_campaign(
     return errors, warnings
 
 
+# App ad (AppAdInfo) asset limits. App campaign text ideas are headlines
+# (<=30 chars) and descriptions (<=90 chars), up to 5 of each.
+_APP_HEADLINE_MAX = 30
+_APP_DESCRIPTION_MAX = 90
+_APP_AD_MAX_ASSETS = 5
+
+
+def _validate_app_ad(
+    *,
+    campaign_id: str,
+    headlines: list[str],
+    descriptions: list[str],
+) -> tuple[list[str], list[str]]:
+    """Validate App ad text assets. Returns (errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not campaign_id:
+        errors.append("campaign_id is required")
+    if not headlines:
+        errors.append("At least one headline is required (each <=30 characters)")
+    if not descriptions:
+        errors.append("At least one description is required (each <=90 characters)")
+
+    if len(headlines) > _APP_AD_MAX_ASSETS:
+        errors.append(
+            f"Too many headlines ({len(headlines)}) — App ads allow at most "
+            f"{_APP_AD_MAX_ASSETS}"
+        )
+    if len(descriptions) > _APP_AD_MAX_ASSETS:
+        errors.append(
+            f"Too many descriptions ({len(descriptions)}) — App ads allow at most "
+            f"{_APP_AD_MAX_ASSETS}"
+        )
+
+    for i, h in enumerate(headlines):
+        if len(h) > _APP_HEADLINE_MAX:
+            errors.append(
+                f"Headline {i + 1} is {len(h)} chars (max {_APP_HEADLINE_MAX}): '{h}'"
+            )
+    for i, d in enumerate(descriptions):
+        if len(d) > _APP_DESCRIPTION_MAX:
+            errors.append(
+                f"Description {i + 1} is {len(d)} chars "
+                f"(max {_APP_DESCRIPTION_MAX}): '{d}'"
+            )
+
+    if headlines and len(headlines) < _APP_AD_MAX_ASSETS:
+        warnings.append(
+            f"Only {len(headlines)} headline(s) provided. Google rotates up to "
+            f"{_APP_AD_MAX_ASSETS} — more diversity usually improves performance."
+        )
+    if descriptions and len(descriptions) < _APP_AD_MAX_ASSETS:
+        warnings.append(
+            f"Only {len(descriptions)} description(s) provided. Google rotates up to "
+            f"{_APP_AD_MAX_ASSETS} — more diversity usually improves performance."
+        )
+
+    return errors, warnings
+
+
+def _preflight_app_ad_checks(
+    config: AdLoopConfig,
+    customer_id: str,
+    campaign_id: str,
+) -> tuple[list[str], list[str]]:
+    """Pre-flight checks before adding an App ad.
+
+    Errors if the target campaign is not an App campaign. Warns if it already
+    has an ad group (this tool creates a new one — a second ad group is rarely
+    intended for an App campaign).
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not campaign_id:
+        return errors, warnings
+
+    try:
+        from adloop.ads.gaql import execute_query
+
+        rows = execute_query(
+            config,
+            customer_id,
+            f"""
+            SELECT campaign.advertising_channel_sub_type
+            FROM campaign
+            WHERE campaign.id = {campaign_id}
+            """,
+        )
+        if not rows:
+            errors.append(f"Campaign {campaign_id} was not found")
+            return errors, warnings
+        sub_type = rows[0].get("campaign.advertising_channel_sub_type", "")
+        if sub_type != "APP_CAMPAIGN":
+            errors.append(
+                f"Campaign {campaign_id} is not an App campaign "
+                f"(advertising_channel_sub_type={sub_type or 'NONE'}). "
+                "draft_app_ad only works on App campaigns."
+            )
+            return errors, warnings
+
+        ag_rows = execute_query(
+            config,
+            customer_id,
+            f"SELECT ad_group.id FROM ad_group WHERE campaign.id = {campaign_id}",
+        )
+        if ag_rows:
+            warnings.append(
+                f"Campaign {campaign_id} already has {len(ag_rows)} ad group(s). "
+                "This will add a NEW ad group — App campaigns usually need only one."
+            )
+    except Exception as e:  # pragma: no cover - network/permission failures
+        warnings.append(f"Could not pre-validate the campaign ({e}).")
+
+    return errors, warnings
+
+
 def _validate_keywords(ad_group_id: str, keywords: list[dict]) -> list[str]:
     errors = []
     if not ad_group_id:
@@ -2323,6 +2505,7 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
     dispatch = {
         "create_campaign": _apply_create_campaign,
         "create_app_campaign": _apply_create_app_campaign,
+        "create_app_ad": _apply_create_app_ad,
         "create_ad_group": _apply_create_ad_group,
         "update_campaign": _apply_update_campaign,
         "update_ad_group": _apply_update_ad_group,
@@ -2624,6 +2807,55 @@ def _apply_create_app_campaign(client: object, cid: str, changes: dict) -> dict:
                 results.setdefault("geo_targets", []).append(rn)
             else:
                 results.setdefault("language_targets", []).append(rn)
+
+    return results
+
+
+def _apply_create_app_ad(client: object, cid: str, changes: dict) -> dict:
+    """Create an ad group + App ad (text assets) in an App campaign atomically.
+
+    App campaign ad groups take no type (the API assigns it). The AppAd carries
+    headlines (<=30 chars) and descriptions (<=90 chars) as AdTextAssets.
+    """
+    service = client.get_service("GoogleAdsService")
+    campaign_service = client.get_service("CampaignService")
+    ad_group_service = client.get_service("AdGroupService")
+
+    operations: list = []
+
+    # 1. AdGroup (temp ID: -1) in the App campaign. No type_ for App campaigns.
+    ag_op = client.get_type("MutateOperation")
+    ad_group = ag_op.ad_group_operation.create
+    ad_group.resource_name = ad_group_service.ad_group_path(cid, "-1")
+    ad_group.name = changes["ad_group_name"]
+    ad_group.campaign = campaign_service.campaign_path(cid, changes["campaign_id"])
+    ad_group.status = client.enums.AdGroupStatusEnum.ENABLED
+    operations.append(ag_op)
+
+    # 2. AdGroupAd with an AppAd carrying the text assets (references ad group -1)
+    ad_op = client.get_type("MutateOperation")
+    ad_group_ad = ad_op.ad_group_ad_operation.create
+    ad_group_ad.ad_group = ad_group_service.ad_group_path(cid, "-1")
+    ad_group_ad.status = client.enums.AdGroupAdStatusEnum.ENABLED
+
+    for text in changes.get("headlines") or []:
+        asset = client.get_type("AdTextAsset")
+        asset.text = text
+        ad_group_ad.ad.app_ad.headlines.append(asset)
+    for text in changes.get("descriptions") or []:
+        asset = client.get_type("AdTextAsset")
+        asset.text = text
+        ad_group_ad.ad.app_ad.descriptions.append(asset)
+
+    operations.append(ad_op)
+
+    response = service.mutate(customer_id=cid, mutate_operations=operations)
+
+    results: dict = {}
+    for i, resp in enumerate(response.mutate_operation_responses):
+        rn = _extract_resource_name(resp)
+        if rn:
+            results["ad_group" if i == 0 else "ad_group_ad"] = rn
 
     return results
 

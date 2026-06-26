@@ -963,6 +963,41 @@ def draft_app_campaign(
 
 @mcp.tool(annotations=_WRITE)
 @_safe
+def draft_app_ad(
+    campaign_id: str,
+    headlines: _StrList,
+    descriptions: _StrList,
+    customer_id: str = "",
+    ad_group_name: str = "",
+) -> dict:
+    """Draft the text assets (App ad) for an App campaign — PREVIEW, creates nothing.
+
+    App campaigns have no keywords — the headlines, descriptions and store
+    listing ARE the creative. This creates an ad group + an App ad carrying the
+    text ideas Google rotates across Search, Play, YouTube and Display. Add
+    images/videos separately in the Google Ads UI.
+
+    campaign_id: the App campaign to add the ad to (from draft_app_campaign).
+    headlines: 1-5 short text ideas, each <=30 characters.
+    descriptions: 1-5 longer text ideas, each <=90 characters.
+    ad_group_name: optional name for the ad group that holds the ad.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_app_ad as _impl
+
+    return _impl(
+        _config,
+        customer_id=customer_id or _config.ads.customer_id,
+        campaign_id=campaign_id,
+        headlines=headlines,
+        descriptions=descriptions,
+        ad_group_name=ad_group_name,
+    )
+
+
+@mcp.tool(annotations=_WRITE)
+@_safe
 def draft_ad_group(
     campaign_id: str,
     ad_group_name: str,
