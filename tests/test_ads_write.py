@@ -284,6 +284,163 @@ def test_update_campaign_rejects_max_cpc_for_non_target_spend(config, monkeypatc
     assert "TARGET_SPEND" in result["details"][0]
 
 
+def test_update_campaign_rename(config):
+    result = write.update_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        name="PC-US-Lite",
+    )
+
+    assert result["operation"] == "update_campaign"
+    assert result["changes"]["name"] == "PC-US-Lite"
+
+
+def test_apply_update_campaign_rename_sets_name_field_mask():
+    google_ads_service = _FakeGoogleAdsService(
+        [_FakeMutateOperationResponse("campaign_result", "customers/1234567890/campaigns/1001")]
+    )
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "CampaignService": _FakePathService("campaigns"),
+        }
+    )
+
+    write._apply_update_campaign(
+        client,
+        "1234567890",
+        {"campaign_id": "1001", "name": "PC-US-Lite"},
+    )
+
+    op = google_ads_service.operations[0].campaign_operation
+    assert op.update.name == "PC-US-Lite"
+    assert "name" in list(op.update_mask.paths)
+
+
+def test_draft_app_campaign_returns_preview(config):
+    result = write.draft_app_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_name="PC-US-Lite",
+        app_id="com.binitex.pianochords",
+        app_store="GOOGLE_APP_STORE",
+        daily_budget=20,
+        target_cpa=0.40,
+        app_optimization_goal="INSTALLS",
+        geo_target_ids=["2840"],
+        language_ids=["1000"],
+    )
+
+    assert result["operation"] == "create_app_campaign"
+    assert result["changes"]["app_id"] == "com.binitex.pianochords"
+    assert result["changes"]["app_optimization_goal"] == "INSTALLS"
+    # 20 == 50 * 0.40, so the learning-budget warning should NOT fire.
+    assert "warnings" not in result
+
+
+def test_draft_app_campaign_requires_app_id_and_target_cpa(config):
+    result = write.draft_app_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_name="PC-US-Lite",
+        daily_budget=20,
+        geo_target_ids=["2840"],
+        language_ids=["1000"],
+    )
+
+    assert result["error"] == "Validation failed"
+    joined = " ".join(result["details"])
+    assert "app_id is required" in joined
+    assert "target_cpa is required" in joined
+
+
+def test_draft_app_campaign_in_app_actions_requires_conversion_ids(config):
+    result = write.draft_app_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_name="PC-US-Lite",
+        app_id="com.binitex.pianochords",
+        daily_budget=20,
+        target_cpa=8,
+        app_optimization_goal="IN_APP_ACTIONS",
+        geo_target_ids=["2840"],
+        language_ids=["1000"],
+    )
+
+    assert result["error"] == "Validation failed"
+    assert any("conversion_action_ids is required" in d for d in result["details"])
+
+
+def test_apply_create_app_campaign_builds_app_settings():
+    google_ads_service = _FakeGoogleAdsService(
+        [
+            _FakeMutateOperationResponse(
+                "campaign_budget_result", "customers/1234567890/campaignBudgets/1"
+            ),
+            _FakeMutateOperationResponse(
+                "campaign_result", "customers/1234567890/campaigns/2"
+            ),
+            _FakeMutateOperationResponse(
+                "campaign_criterion_result",
+                "customers/1234567890/campaignCriteria/2~3",
+            ),
+            _FakeMutateOperationResponse(
+                "campaign_criterion_result",
+                "customers/1234567890/campaignCriteria/2~4",
+            ),
+        ]
+    )
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "CampaignService": _FakePathService("campaigns"),
+            "CampaignBudgetService": _FakePathService("campaignBudgets"),
+        }
+    )
+
+    results = write._apply_create_app_campaign(
+        client,
+        "1234567890",
+        {
+            "campaign_name": "PC-US-Lite",
+            "app_id": "com.binitex.pianochords",
+            "app_store": "GOOGLE_APP_STORE",
+            "daily_budget": 20,
+            "target_cpa": 0.40,
+            "app_optimization_goal": "INSTALLS",
+            "geo_target_ids": ["2840"],
+            "language_ids": ["1000"],
+            "conversion_action_ids": [],
+        },
+    )
+
+    campaign = google_ads_service.operations[1].campaign_operation.create
+    enums = client.enums
+    assert (
+        campaign.advertising_channel_type
+        == enums.AdvertisingChannelTypeEnum.MULTI_CHANNEL
+    )
+    assert (
+        campaign.advertising_channel_sub_type
+        == enums.AdvertisingChannelSubTypeEnum.APP_CAMPAIGN
+    )
+    assert campaign.app_campaign_setting.app_id == "com.binitex.pianochords"
+    assert (
+        campaign.app_campaign_setting.app_store
+        == enums.AppCampaignAppStoreEnum.GOOGLE_APP_STORE
+    )
+    assert (
+        campaign.app_campaign_setting.bidding_strategy_goal_type
+        == enums.AppCampaignBiddingStrategyGoalTypeEnum.OPTIMIZE_INSTALLS_TARGET_INSTALL_COST
+    )
+    assert campaign.target_cpa.target_cpa_micros == 400_000
+    assert campaign.status == enums.CampaignStatusEnum.PAUSED
+    assert results["campaign"] == "customers/1234567890/campaigns/2"
+    assert len(results["geo_targets"]) == 1
+    assert len(results["language_targets"]) == 1
+
+
 def test_draft_structured_snippets_rejects_invalid_header(config):
     result = write.draft_structured_snippets(
         config,

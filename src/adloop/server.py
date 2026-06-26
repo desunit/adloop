@@ -909,6 +909,60 @@ def draft_campaign(
 
 @mcp.tool(annotations=_WRITE)
 @_safe
+def draft_app_campaign(
+    campaign_name: str,
+    app_id: str,
+    daily_budget: float,
+    target_cpa: float,
+    geo_target_ids: _StrList,
+    language_ids: _StrList,
+    customer_id: str = "",
+    app_store: str = "GOOGLE_APP_STORE",
+    app_optimization_goal: str = "INSTALLS",
+    conversion_action_ids: _StrListOpt = None,
+) -> dict:
+    """Draft a Google App campaign (Universal App Campaign) — PREVIEW, creates nothing.
+
+    Use this to promote a mobile app. Unlike Search campaigns (draft_campaign),
+    App campaigns are MULTI_CHANNEL / APP_CAMPAIGN: NO keywords, NO ad groups,
+    NO network settings — Google auto-targets across Search, Play, YouTube and
+    Display from the store listing and the assets you add later. Created PAUSED.
+
+    campaign_name: e.g. "PC-US-Lite".
+    app_id: Android package name (e.g. "com.binitex.pianochords") or the iOS App
+        Store numeric id.
+    app_store: GOOGLE_APP_STORE | APPLE_APP_STORE (default GOOGLE_APP_STORE).
+    daily_budget: daily budget in account currency.
+    target_cpa: REQUIRED — target install cost (INSTALLS goal) or in-app action
+        cost (IN_APP_ACTIONS goal). Google recommends daily_budget >= 50x this.
+    app_optimization_goal: INSTALLS (optimize for install volume) | IN_APP_ACTIONS
+        (optimize for in-app conversions — requires conversion_action_ids).
+    conversion_action_ids: in-app conversion action IDs to optimize toward;
+        REQUIRED when app_optimization_goal is IN_APP_ACTIONS.
+    geo_target_ids: REQUIRED geo target constant IDs (e.g. ["2840"] USA, ["2826"] UK).
+    language_ids: REQUIRED language constant IDs (e.g. ["1000"] English).
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.ads.write import draft_app_campaign as _impl
+
+    return _impl(
+        _config,
+        customer_id=customer_id or _config.ads.customer_id,
+        campaign_name=campaign_name,
+        app_id=app_id,
+        app_store=app_store,
+        daily_budget=daily_budget,
+        target_cpa=target_cpa,
+        app_optimization_goal=app_optimization_goal,
+        geo_target_ids=geo_target_ids,
+        language_ids=language_ids,
+        conversion_action_ids=conversion_action_ids,
+    )
+
+
+@mcp.tool(annotations=_WRITE)
+@_safe
 def draft_ad_group(
     campaign_id: str,
     ad_group_name: str,
@@ -945,6 +999,7 @@ def draft_ad_group(
 def update_campaign(
     campaign_id: str,
     customer_id: str = "",
+    name: str = "",
     bidding_strategy: str = "",
     target_cpa: float = 0,
     target_roas: float = 0,
@@ -958,9 +1013,11 @@ def update_campaign(
 ) -> dict:
     """Draft an update to an existing campaign — returns a PREVIEW, does NOT apply.
 
-    Only include the parameters you want to change. Omit the rest.
+    Only include the parameters you want to change. Omit the rest. Works for any
+    campaign type (Search, App, PMax, etc.) — name/budget changes apply to all.
 
     campaign_id: the numeric ID of the campaign to update (required)
+    name: new campaign name (rename). Works for any campaign type.
     bidding_strategy: MAXIMIZE_CONVERSIONS | TARGET_CPA | TARGET_ROAS |
                       MAXIMIZE_CONVERSION_VALUE | TARGET_SPEND | MANUAL_CPC
     target_cpa: required if bidding_strategy is TARGET_CPA (in account currency)
@@ -984,6 +1041,7 @@ def update_campaign(
         _config,
         customer_id=customer_id or _config.ads.customer_id,
         campaign_id=campaign_id,
+        name=name,
         bidding_strategy=bidding_strategy,
         target_cpa=target_cpa,
         target_roas=target_roas,

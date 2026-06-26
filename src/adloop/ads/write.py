@@ -917,6 +917,97 @@ def draft_campaign(
     return preview
 
 
+def draft_app_campaign(
+    config: AdLoopConfig,
+    *,
+    customer_id: str = "",
+    campaign_name: str = "",
+    app_id: str = "",
+    app_store: str = "GOOGLE_APP_STORE",
+    daily_budget: float = 0,
+    target_cpa: float = 0,
+    app_optimization_goal: str = "INSTALLS",
+    geo_target_ids: list[str] | None = None,
+    language_ids: list[str] | None = None,
+    conversion_action_ids: list[str] | None = None,
+) -> dict:
+    """Draft a Google App campaign (Universal App Campaign) — preview only.
+
+    Creates: CampaignBudget + App Campaign (PAUSED, MULTI_CHANNEL / APP_CAMPAIGN)
+    + geo targeting + language targeting. Unlike Search campaigns, App campaigns
+    have NO keywords and NO ad groups here — Google auto-targets from the store
+    listing and the text/image/video assets you add later. The campaign is
+    created PAUSED so you can add assets and review before enabling.
+
+    app_id: Android package name (e.g. "com.example.app") or the iOS App Store
+        numeric id.
+    app_store: GOOGLE_APP_STORE | APPLE_APP_STORE.
+    app_optimization_goal: INSTALLS (optimize for install volume; target_cpa is
+        the target install cost) | IN_APP_ACTIONS (optimize for in-app
+        conversions; target_cpa is the target action cost — requires
+        conversion_action_ids).
+    target_cpa: REQUIRED — target install or in-app action cost (account currency).
+    conversion_action_ids: in-app conversion action IDs to optimize toward;
+        REQUIRED when app_optimization_goal is IN_APP_ACTIONS.
+
+    Call confirm_and_apply with the returned plan_id to execute.
+    """
+    from adloop.safety.guards import (
+        SafetyViolation,
+        check_blocked_operation,
+        check_budget_cap,
+    )
+    from adloop.safety.preview import ChangePlan, store_plan
+
+    try:
+        check_blocked_operation("create_app_campaign", config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    errors, warnings = _validate_app_campaign(
+        config,
+        campaign_name=campaign_name,
+        app_id=app_id,
+        app_store=app_store,
+        daily_budget=daily_budget,
+        target_cpa=target_cpa,
+        app_optimization_goal=app_optimization_goal,
+        geo_target_ids=geo_target_ids,
+        language_ids=language_ids,
+        conversion_action_ids=conversion_action_ids,
+        customer_id=customer_id,
+    )
+    if errors:
+        return {"error": "Validation failed", "details": errors}
+
+    try:
+        check_budget_cap(daily_budget, config.safety)
+    except SafetyViolation as e:
+        return {"error": str(e)}
+
+    plan = ChangePlan(
+        operation="create_app_campaign",
+        entity_type="campaign",
+        customer_id=customer_id,
+        changes={
+            "campaign_name": campaign_name,
+            "app_id": app_id,
+            "app_store": app_store.upper(),
+            "daily_budget": daily_budget,
+            "target_cpa": target_cpa,
+            "app_optimization_goal": app_optimization_goal.upper(),
+            "geo_target_ids": geo_target_ids or [],
+            "language_ids": language_ids or [],
+            "conversion_action_ids": conversion_action_ids or [],
+        },
+    )
+    store_plan(plan)
+    preview = plan.to_preview()
+    if warnings:
+        preview["warnings"] = warnings
+    return preview
+
+
 def draft_ad_group(
     config: AdLoopConfig,
     *,
@@ -982,6 +1073,7 @@ def update_campaign(
     *,
     customer_id: str = "",
     campaign_id: str = "",
+    name: str = "",
     bidding_strategy: str = "",
     target_cpa: float = 0,
     target_roas: float = 0,
@@ -1056,6 +1148,7 @@ def update_campaign(
             errors.append("max_cpc requires TARGET_SPEND bidding_strategy")
 
     has_any_change = any([
+        bool(name),
         bs,
         daily_budget,
         geo_target_ids is not None,
@@ -1106,6 +1199,8 @@ def update_campaign(
             )
 
     changes: dict = {"campaign_id": campaign_id}
+    if name:
+        changes["name"] = name
     if bs:
         changes["bidding_strategy"] = bs
     if target_cpa:
@@ -1809,6 +1904,19 @@ _VALID_BIDDING_STRATEGIES = {
 
 _VALID_CHANNEL_TYPES = {"SEARCH", "DISPLAY", "SHOPPING", "VIDEO", "PERFORMANCE_MAX"}
 
+# App campaign (Universal App Campaign) constants. App campaigns use
+# advertising_channel_type=MULTI_CHANNEL + advertising_channel_sub_type=APP_CAMPAIGN
+# and are configured very differently from Search campaigns (no keywords, no ad
+# groups, no network_settings — Google auto-targets from the store listing and
+# the assets). They get their own draft tool (draft_app_campaign).
+_VALID_APP_STORES = {"GOOGLE_APP_STORE", "APPLE_APP_STORE"}
+_VALID_APP_GOALS = {"INSTALLS", "IN_APP_ACTIONS"}
+# Maps the user-facing goal to the Google Ads AppCampaignBiddingStrategyGoalType.
+_APP_GOAL_TO_ENUM = {
+    "INSTALLS": "OPTIMIZE_INSTALLS_TARGET_INSTALL_COST",
+    "IN_APP_ACTIONS": "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST",
+}
+
 
 def _validate_campaign(
     config: AdLoopConfig,
@@ -1906,6 +2014,82 @@ def _validate_campaign(
         warnings.append(
             "MANUAL_CPC bidding requires constant monitoring. Consider using "
             "MAXIMIZE_CONVERSIONS or TARGET_CPA for automated optimization."
+        )
+
+    return errors, warnings
+
+
+def _validate_app_campaign(
+    config: AdLoopConfig,
+    *,
+    campaign_name: str,
+    app_id: str,
+    app_store: str,
+    daily_budget: float,
+    target_cpa: float,
+    app_optimization_goal: str,
+    geo_target_ids: list[str] | None,
+    language_ids: list[str] | None,
+    conversion_action_ids: list[str] | None,
+    customer_id: str = "",
+) -> tuple[list[str], list[str]]:
+    """Validate App campaign draft inputs. Returns (errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not campaign_name or not campaign_name.strip():
+        errors.append("campaign_name is required")
+    if not app_id or not app_id.strip():
+        errors.append(
+            "app_id is required (Android package name like 'com.example.app' "
+            "or the iOS App Store numeric id)"
+        )
+    if app_store.upper() not in _VALID_APP_STORES:
+        errors.append(
+            f"app_store must be one of {sorted(_VALID_APP_STORES)}, got '{app_store}'"
+        )
+    if daily_budget <= 0:
+        errors.append("daily_budget must be greater than 0")
+    if target_cpa <= 0:
+        errors.append(
+            "target_cpa is required and must be greater than 0 "
+            "(the target install or in-app action cost)"
+        )
+
+    goal = app_optimization_goal.upper()
+    if goal not in _VALID_APP_GOALS:
+        errors.append(
+            f"app_optimization_goal must be one of {sorted(_VALID_APP_GOALS)}, "
+            f"got '{app_optimization_goal}'"
+        )
+    if not geo_target_ids:
+        errors.append(
+            "geo_target_ids is required — App campaigns must target at least one "
+            "country/region (e.g. ['2840'] for USA, ['2826'] for UK)"
+        )
+    if not language_ids:
+        errors.append(
+            "language_ids is required — App campaigns must target at least one "
+            "language (e.g. ['1000'] for English)"
+        )
+    if goal == "IN_APP_ACTIONS" and not conversion_action_ids:
+        errors.append(
+            "conversion_action_ids is required when app_optimization_goal is "
+            "IN_APP_ACTIONS (the in-app conversion action(s) to optimize toward)"
+        )
+
+    # App campaigns need volume to exit the learning phase. Google recommends a
+    # daily budget of at least 50x the target CPA — below this the algorithm
+    # often can't gather enough conversions to optimize.
+    if not errors and target_cpa > 0 and daily_budget < 50 * target_cpa:
+        from adloop.ads.currency import format_currency, get_currency_code
+
+        currency_code = get_currency_code(config, customer_id)
+        warnings.append(
+            f"Daily budget {format_currency(daily_budget, currency_code)} is below "
+            f"Google's recommended 50x target CPA for App campaigns "
+            f"({format_currency(50 * target_cpa, currency_code)}/day). Below this the "
+            f"campaign may struggle to exit the learning phase."
         )
 
     return errors, warnings
@@ -2138,6 +2322,7 @@ def _execute_plan(config: AdLoopConfig, plan: object) -> dict:
 
     dispatch = {
         "create_campaign": _apply_create_campaign,
+        "create_app_campaign": _apply_create_app_campaign,
         "create_ad_group": _apply_create_ad_group,
         "update_campaign": _apply_update_campaign,
         "update_ad_group": _apply_update_ad_group,
@@ -2343,6 +2528,106 @@ def _apply_create_campaign(client: object, cid: str, changes: dict) -> dict:
     return results
 
 
+def _apply_create_app_campaign(client: object, cid: str, changes: dict) -> dict:
+    """Create an App campaign (MULTI_CHANNEL / APP_CAMPAIGN) + budget + targeting.
+
+    App campaigns differ from Search campaigns: no ad groups, no keywords, no
+    network_settings (Google auto-manages networks). The optimization goal and
+    the app to promote live on campaign.app_campaign_setting; bidding is TargetCpa.
+    """
+    service = client.get_service("GoogleAdsService")
+    campaign_service = client.get_service("CampaignService")
+    budget_service = client.get_service("CampaignBudgetService")
+
+    operations: list = []
+
+    # 1. CampaignBudget (temp ID: -1). App campaigns require STANDARD delivery.
+    budget_op = client.get_type("MutateOperation")
+    budget = budget_op.campaign_budget_operation.create
+    budget.resource_name = budget_service.campaign_budget_path(cid, "-1")
+    budget.name = f"Budget - {changes['campaign_name']}"
+    budget.amount_micros = int(changes["daily_budget"] * 1_000_000)
+    budget.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    budget.explicitly_shared = False
+    operations.append(budget_op)
+
+    # 2. Campaign (temp ID: -2, references budget -1)
+    campaign_op = client.get_type("MutateOperation")
+    campaign = campaign_op.campaign_operation.create
+    campaign.resource_name = campaign_service.campaign_path(cid, "-2")
+    campaign.name = changes["campaign_name"]
+    campaign.campaign_budget = budget_service.campaign_budget_path(cid, "-1")
+    campaign.status = client.enums.CampaignStatusEnum.PAUSED
+    campaign.advertising_channel_type = (
+        client.enums.AdvertisingChannelTypeEnum.MULTI_CHANNEL
+    )
+    campaign.advertising_channel_sub_type = (
+        client.enums.AdvertisingChannelSubTypeEnum.APP_CAMPAIGN
+    )
+
+    # Which app + how to optimize.
+    campaign.app_campaign_setting.app_id = changes["app_id"]
+    campaign.app_campaign_setting.app_store = getattr(
+        client.enums.AppCampaignAppStoreEnum, changes["app_store"]
+    )
+    goal_enum = _APP_GOAL_TO_ENUM[changes["app_optimization_goal"]]
+    campaign.app_campaign_setting.bidding_strategy_goal_type = getattr(
+        client.enums.AppCampaignBiddingStrategyGoalTypeEnum, goal_enum
+    )
+
+    # TargetCpa bidding — the target install / in-app action cost.
+    campaign.target_cpa.target_cpa_micros = int(changes["target_cpa"] * 1_000_000)
+
+    # In-app action optimization needs the specific conversion action(s).
+    conv_ids = changes.get("conversion_action_ids") or []
+    if conv_ids:
+        conv_service = client.get_service("ConversionActionService")
+        for conv_id in conv_ids:
+            campaign.selective_optimization.conversion_actions.append(
+                conv_service.conversion_action_path(cid, conv_id)
+            )
+
+    # EU political advertising declaration (see _apply_create_campaign).
+    campaign.contains_eu_political_advertising = (
+        client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
+    )
+    operations.append(campaign_op)
+
+    # 3. Geo targeting (CampaignCriterion referencing campaign -2)
+    for geo_id in changes.get("geo_target_ids") or []:
+        geo_op = client.get_type("MutateOperation")
+        geo_criterion = geo_op.campaign_criterion_operation.create
+        geo_criterion.campaign = campaign_service.campaign_path(cid, "-2")
+        geo_criterion.location.geo_target_constant = f"geoTargetConstants/{geo_id}"
+        operations.append(geo_op)
+
+    # 4. Language targeting (CampaignCriterion referencing campaign -2)
+    for lang_id in changes.get("language_ids") or []:
+        lang_op = client.get_type("MutateOperation")
+        lang_criterion = lang_op.campaign_criterion_operation.create
+        lang_criterion.campaign = campaign_service.campaign_path(cid, "-2")
+        lang_criterion.language.language_constant = f"languageConstants/{lang_id}"
+        operations.append(lang_op)
+
+    response = service.mutate(customer_id=cid, mutate_operations=operations)
+
+    results: dict = {}
+    num_geo = len(changes.get("geo_target_ids") or [])
+    for i, resp in enumerate(response.mutate_operation_responses):
+        rn = _extract_resource_name(resp)
+        if rn:
+            if i == 0:
+                results["campaign_budget"] = rn
+            elif i == 1:
+                results["campaign"] = rn
+            elif i < 2 + num_geo:
+                results.setdefault("geo_targets", []).append(rn)
+            else:
+                results.setdefault("language_targets", []).append(rn)
+
+    return results
+
+
 def _apply_create_ad_group(client: object, cid: str, changes: dict) -> dict:
     """Create ad group + optional keywords in an existing campaign atomically."""
     service = client.get_service("GoogleAdsService")
@@ -2402,11 +2687,13 @@ def _apply_update_campaign(client: object, cid: str, changes: dict) -> dict:
     resource_name = campaign_service.campaign_path(cid, campaign_id)
 
     # Bid strategy and campaign-level setting changes
+    new_name = changes.get("name")
     bs = changes.get("bidding_strategy")
     search_partners_enabled = changes.get("search_partners_enabled")
     display_network_enabled = changes.get("display_network_enabled")
     if (
-        bs
+        new_name
+        or bs
         or search_partners_enabled is not None
         or display_network_enabled is not None
         or changes.get("max_cpc")
@@ -2414,6 +2701,10 @@ def _apply_update_campaign(client: object, cid: str, changes: dict) -> dict:
         campaign_op = client.get_type("MutateOperation")
         campaign = campaign_op.campaign_operation.update
         campaign.resource_name = resource_name
+
+        if new_name:
+            campaign.name = new_name
+            field_paths.append("name")
 
         if bs == "MAXIMIZE_CONVERSIONS":
             campaign.maximize_conversions.target_cpa_micros = 0
