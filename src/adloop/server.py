@@ -1045,6 +1045,8 @@ def update_campaign(
     display_network_enabled: bool | None = None,
     display_expansion_enabled: bool | None = None,
     max_cpc: float = 0,
+    app_optimization_goal: str = "",
+    conversion_action_ids: _StrListOpt = None,
 ) -> dict:
     """Draft an update to an existing campaign — returns a PREVIEW, does NOT apply.
 
@@ -1053,6 +1055,12 @@ def update_campaign(
 
     campaign_id: the numeric ID of the campaign to update (required)
     name: new campaign name (rename). Works for any campaign type.
+    app_optimization_goal: App campaigns only — switch what the campaign
+        optimizes for: INSTALLS (install volume) | IN_APP_ACTIONS (in-app
+        conversions). With IN_APP_ACTIONS, pass conversion_action_ids and
+        target_cpa (the target in-app action cost).
+    conversion_action_ids: App campaigns only — the in-app conversion action IDs
+        to optimize toward (required with app_optimization_goal=IN_APP_ACTIONS).
     bidding_strategy: MAXIMIZE_CONVERSIONS | TARGET_CPA | TARGET_ROAS |
                       MAXIMIZE_CONVERSION_VALUE | TARGET_SPEND | MANUAL_CPC
     target_cpa: required if bidding_strategy is TARGET_CPA (in account currency)
@@ -1087,6 +1095,8 @@ def update_campaign(
         display_network_enabled=display_network_enabled,
         display_expansion_enabled=display_expansion_enabled,
         max_cpc=max_cpc,
+        app_optimization_goal=app_optimization_goal,
+        conversion_action_ids=conversion_action_ids,
     )
 
 

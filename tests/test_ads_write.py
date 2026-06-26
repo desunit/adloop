@@ -53,6 +53,11 @@ class _FakePathService:
         return f"customers/{customer_id}/{self.prefix}/{entity_id}"
 
 
+class _FakeConversionActionService:
+    def conversion_action_path(self, customer_id: str, entity_id: str) -> str:
+        return f"customers/{customer_id}/conversionActions/{entity_id}"
+
+
 class _FakeAdGroupService(_FakePathService):
     def __init__(self):
         super().__init__("adGroups")
@@ -440,6 +445,74 @@ def test_apply_create_app_campaign_builds_app_settings():
     assert results["campaign"] == "customers/1234567890/campaigns/2"
     assert len(results["geo_targets"]) == 1
     assert len(results["language_targets"]) == 1
+
+
+def test_update_campaign_app_goal_requires_conversion_ids(config):
+    result = write.update_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        app_optimization_goal="IN_APP_ACTIONS",
+    )
+
+    assert result["error"] == "Validation failed"
+    assert any("conversion_action_ids is required" in d for d in result["details"])
+
+
+def test_update_campaign_app_goal_preview(config):
+    result = write.update_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        app_optimization_goal="IN_APP_ACTIONS",
+        conversion_action_ids=["7584841862"],
+        target_cpa=3.0,
+    )
+
+    assert result["operation"] == "update_campaign"
+    assert result["changes"]["app_optimization_goal"] == "IN_APP_ACTIONS"
+    assert result["changes"]["conversion_action_ids"] == ["7584841862"]
+    assert result["changes"]["target_cpa"] == 3.0
+
+
+def test_apply_update_campaign_switches_app_goal():
+    google_ads_service = _FakeGoogleAdsService(
+        [_FakeMutateOperationResponse("campaign_result", "customers/1234567890/campaigns/1001")]
+    )
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "CampaignService": _FakePathService("campaigns"),
+            "ConversionActionService": _FakeConversionActionService(),
+        }
+    )
+
+    write._apply_update_campaign(
+        client,
+        "1234567890",
+        {
+            "campaign_id": "1001",
+            "app_optimization_goal": "IN_APP_ACTIONS",
+            "conversion_action_ids": ["7584841862"],
+            "target_cpa": 3.0,
+        },
+    )
+
+    op = google_ads_service.operations[0].campaign_operation
+    campaign = op.update
+    enums = client.enums
+    assert (
+        campaign.app_campaign_setting.bidding_strategy_goal_type
+        == enums.AppCampaignBiddingStrategyGoalTypeEnum.OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST
+    )
+    assert campaign.target_cpa.target_cpa_micros == 3_000_000
+    assert list(campaign.selective_optimization.conversion_actions) == [
+        "customers/1234567890/conversionActions/7584841862"
+    ]
+    paths = list(op.update_mask.paths)
+    assert "app_campaign_setting.bidding_strategy_goal_type" in paths
+    assert "selective_optimization.conversion_actions" in paths
+    assert "target_cpa.target_cpa_micros" in paths
 
 
 def test_draft_app_ad_rejects_over_limit_text(config, monkeypatch):

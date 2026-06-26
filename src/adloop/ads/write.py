@@ -1149,6 +1149,8 @@ def update_campaign(
     display_network_enabled: bool | None = None,
     display_expansion_enabled: bool | None = None,
     max_cpc: float = 0,
+    app_optimization_goal: str = "",
+    conversion_action_ids: list[str] | None = None,
 ) -> dict:
     """Draft an update to an existing campaign — returns preview, does NOT execute.
 
@@ -1212,6 +1214,23 @@ def update_campaign(
         elif strategy_for_cap != "TARGET_SPEND":
             errors.append("max_cpc requires TARGET_SPEND bidding_strategy")
 
+    # App campaign optimization-goal switch (e.g. installs -> in-app actions).
+    goal = app_optimization_goal.upper() if app_optimization_goal else ""
+    if goal and goal not in _VALID_APP_GOALS:
+        errors.append(
+            f"app_optimization_goal must be one of {sorted(_VALID_APP_GOALS)}, "
+            f"got '{app_optimization_goal}'"
+        )
+    if goal == "IN_APP_ACTIONS" and not conversion_action_ids:
+        errors.append(
+            "conversion_action_ids is required when app_optimization_goal is "
+            "IN_APP_ACTIONS (the in-app conversion action(s) to optimize toward)"
+        )
+    if conversion_action_ids is not None and not goal:
+        errors.append(
+            "conversion_action_ids only applies together with app_optimization_goal"
+        )
+
     has_any_change = any([
         bool(name),
         bs,
@@ -1221,6 +1240,7 @@ def update_campaign(
         search_partners_enabled is not None,
         normalized_display_network_enabled is not None,
         max_cpc,
+        bool(goal),
     ])
     if not has_any_change:
         errors.append("No changes specified — provide at least one parameter to update")
@@ -1266,6 +1286,10 @@ def update_campaign(
     changes: dict = {"campaign_id": campaign_id}
     if name:
         changes["name"] = name
+    if goal:
+        changes["app_optimization_goal"] = goal
+    if conversion_action_ids is not None:
+        changes["conversion_action_ids"] = conversion_action_ids
     if bs:
         changes["bidding_strategy"] = bs
     if target_cpa:
@@ -2921,11 +2945,15 @@ def _apply_update_campaign(client: object, cid: str, changes: dict) -> dict:
     # Bid strategy and campaign-level setting changes
     new_name = changes.get("name")
     bs = changes.get("bidding_strategy")
+    app_goal = changes.get("app_optimization_goal")
+    conv_ids = changes.get("conversion_action_ids")
     search_partners_enabled = changes.get("search_partners_enabled")
     display_network_enabled = changes.get("display_network_enabled")
     if (
         new_name
         or bs
+        or app_goal
+        or conv_ids is not None
         or search_partners_enabled is not None
         or display_network_enabled is not None
         or changes.get("max_cpc")
@@ -2937,6 +2965,27 @@ def _apply_update_campaign(client: object, cid: str, changes: dict) -> dict:
         if new_name:
             campaign.name = new_name
             field_paths.append("name")
+
+        # App campaign optimization-goal switch. App campaigns bid via TargetCpa
+        # (not maximize_conversions), so the target cost is set on campaign.target_cpa.
+        if app_goal:
+            goal_enum = _APP_GOAL_TO_ENUM[app_goal]
+            campaign.app_campaign_setting.bidding_strategy_goal_type = getattr(
+                client.enums.AppCampaignBiddingStrategyGoalTypeEnum, goal_enum
+            )
+            field_paths.append("app_campaign_setting.bidding_strategy_goal_type")
+            if changes.get("target_cpa"):
+                campaign.target_cpa.target_cpa_micros = int(
+                    changes["target_cpa"] * 1_000_000
+                )
+                field_paths.append("target_cpa.target_cpa_micros")
+        if conv_ids is not None:
+            conv_service = client.get_service("ConversionActionService")
+            for conv_id in conv_ids:
+                campaign.selective_optimization.conversion_actions.append(
+                    conv_service.conversion_action_path(cid, conv_id)
+                )
+            field_paths.append("selective_optimization.conversion_actions")
 
         if bs == "MAXIMIZE_CONVERSIONS":
             campaign.maximize_conversions.target_cpa_micros = 0
