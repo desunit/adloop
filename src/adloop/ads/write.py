@@ -7,6 +7,7 @@ Every write tool returns a preview/plan. Nothing executes until
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -151,6 +152,15 @@ def _parse_image_metadata(path_str: str) -> dict[str, object]:
         "width": width,
         "height": height,
     }
+
+
+def _extract_youtube_id(value: str) -> str:
+    """Return the 11-char YouTube video id from a raw id or a watch/share URL."""
+    value = value.strip()
+    match = re.search(r"(?:v=|/shorts/|/embed/|youtu\.be/)([A-Za-z0-9_-]{11})", value)
+    if match:
+        return match.group(1)
+    return value
 
 
 def _build_image_asset_name(path: Path, data: bytes) -> str:
@@ -1020,17 +1030,25 @@ def draft_app_ad(
     headlines: list[str] | None = None,
     descriptions: list[str] | None = None,
     ad_group_name: str = "",
+    image_paths: list[str] | None = None,
+    youtube_video_ids: list[str] | None = None,
 ) -> dict:
-    """Draft the text assets (App ad) for an App campaign — preview only.
+    """Draft the creative assets (App ad) for an App campaign — preview only.
 
-    Creates an ad group + an App ad (AppAdInfo) carrying the text ideas Google
-    rotates across Search/Play/YouTube/Display. App campaigns have no keywords;
-    the headlines (<=30 chars) and descriptions (<=90 chars) plus the store
-    listing ARE the creative. Images/videos are added separately in the UI.
+    Creates an ad group + an App ad (AppAdInfo) carrying the text, image and
+    video ideas Google rotates across Search/Play/YouTube/Display. App campaigns
+    have no keywords; the headlines (<=30 chars), descriptions (<=90 chars),
+    images, videos plus the store listing ARE the creative.
 
     headlines: 1-5 short text ideas, each <=30 characters.
     descriptions: 1-5 longer text ideas, each <=90 characters.
     ad_group_name: optional name for the ad group that holds the ad.
+    image_paths: optional 0-20 local PNG/JPEG/GIF files uploaded as image
+        assets on the App ad. App-campaign image creative lives on the App ad,
+        not as campaign-level assets (that is why draft_image_assets — which
+        attaches CampaignAssets — does not work for App campaigns).
+    youtube_video_ids: optional 0-20 YouTube video IDs (the 11-char id from a
+        youtube.com/watch?v=<id> URL) uploaded as video assets on the App ad.
 
     Call confirm_and_apply with the returned plan_id to execute.
     """
@@ -1044,12 +1062,32 @@ def draft_app_ad(
 
     headlines = [h for h in (headlines or []) if h and h.strip()]
     descriptions = [d for d in (descriptions or []) if d and d.strip()]
+    image_paths = [p for p in (image_paths or []) if p and p.strip()]
+    youtube_video_ids = [_extract_youtube_id(v) for v in (youtube_video_ids or []) if v and v.strip()]
 
     errors, warnings = _validate_app_ad(
         campaign_id=campaign_id,
         headlines=headlines,
         descriptions=descriptions,
     )
+
+    validated_images: list[dict] = []
+    for index, image_path in enumerate(image_paths):
+        try:
+            validated_images.append(_parse_image_metadata(image_path))
+        except ValueError as exc:
+            errors.append(f"Image {index + 1}: {exc}")
+    if len(validated_images) > _APP_AD_MAX_IMAGES:
+        errors.append(
+            f"Too many images ({len(validated_images)}) — App ads allow at most "
+            f"{_APP_AD_MAX_IMAGES}"
+        )
+    if len(youtube_video_ids) > _APP_AD_MAX_VIDEOS:
+        errors.append(
+            f"Too many videos ({len(youtube_video_ids)}) — App ads allow at most "
+            f"{_APP_AD_MAX_VIDEOS}"
+        )
+
     if errors:
         return {"error": "Validation failed", "details": errors}
 
@@ -1068,6 +1106,8 @@ def draft_app_ad(
             "ad_group_name": ad_group_name or "Ad group 1",
             "headlines": headlines,
             "descriptions": descriptions,
+            "images": validated_images,
+            "youtube_video_ids": youtube_video_ids,
         },
     )
     store_plan(plan)
@@ -2308,6 +2348,9 @@ def _validate_app_campaign(
 _APP_HEADLINE_MAX = 30
 _APP_DESCRIPTION_MAX = 90
 _APP_AD_MAX_ASSETS = 5
+# App ads accept up to 20 image and 20 YouTube video assets each.
+_APP_AD_MAX_IMAGES = 20
+_APP_AD_MAX_VIDEOS = 20
 
 
 def _validate_app_ad(
@@ -2975,7 +3018,48 @@ def _apply_create_app_ad(client: object, cid: str, changes: dict) -> dict:
     ad_group.status = client.enums.AdGroupStatusEnum.ENABLED
     operations.append(ag_op)
 
-    # 2. AdGroupAd with an AppAd carrying the text assets (references ad group -1)
+    # 2. Image + YouTube video assets (temp IDs -2, -3, …) created in the same
+    #    atomic batch and referenced by the App ad below. App-campaign creative
+    #    images live on the App ad, not as campaign-level CampaignAssets.
+    next_temp_id = -2
+    image_payloads = changes.get("images") or []
+    video_ids = changes.get("youtube_video_ids") or []
+    asset_service = (
+        client.get_service("AssetService") if (image_payloads or video_ids) else None
+    )
+    image_resource_names: list[str] = []
+    for payload in image_payloads:
+        image_path = Path(str(payload["path"]))
+        image_bytes = image_path.read_bytes()
+        mime_type_name = _VALID_IMAGE_MIME_TYPES[str(payload["mime_type"])]
+        resource_name = asset_service.asset_path(cid, str(next_temp_id))
+        asset_op = client.get_type("MutateOperation")
+        asset = asset_op.asset_operation.create
+        asset.resource_name = resource_name
+        asset.name = str(payload.get("name") or _build_image_asset_name(image_path, image_bytes))
+        asset.type_ = client.enums.AssetTypeEnum.IMAGE
+        asset.image_asset.data = image_bytes
+        asset.image_asset.mime_type = getattr(client.enums.MimeTypeEnum, mime_type_name)
+        asset.image_asset.full_size.width_pixels = int(payload["width"])
+        asset.image_asset.full_size.height_pixels = int(payload["height"])
+        operations.append(asset_op)
+        image_resource_names.append(resource_name)
+        next_temp_id -= 1
+
+    video_resource_names: list[str] = []
+    for video_id in video_ids:
+        resource_name = asset_service.asset_path(cid, str(next_temp_id))
+        asset_op = client.get_type("MutateOperation")
+        asset = asset_op.asset_operation.create
+        asset.resource_name = resource_name
+        asset.name = f"AdLoop video {video_id}"
+        asset.type_ = client.enums.AssetTypeEnum.YOUTUBE_VIDEO
+        asset.youtube_video_asset.youtube_video_id = video_id
+        operations.append(asset_op)
+        video_resource_names.append(resource_name)
+        next_temp_id -= 1
+
+    # 3. AdGroupAd with an AppAd carrying the assets (references ad group -1)
     ad_op = client.get_type("MutateOperation")
     ad_group_ad = ad_op.ad_group_ad_operation.create
     ad_group_ad.ad_group = ad_group_service.ad_group_path(cid, "-1")
@@ -2989,16 +3073,31 @@ def _apply_create_app_ad(client: object, cid: str, changes: dict) -> dict:
         asset = client.get_type("AdTextAsset")
         asset.text = text
         ad_group_ad.ad.app_ad.descriptions.append(asset)
+    for resource_name in image_resource_names:
+        image_asset = client.get_type("AdImageAsset")
+        image_asset.asset = resource_name
+        ad_group_ad.ad.app_ad.images.append(image_asset)
+    for resource_name in video_resource_names:
+        video_asset = client.get_type("AdVideoAsset")
+        video_asset.asset = resource_name
+        ad_group_ad.ad.app_ad.youtube_videos.append(video_asset)
 
     operations.append(ad_op)
 
     response = service.mutate(customer_id=cid, mutate_operations=operations)
 
+    # Responses come back in operation order: ad group, then any asset ops,
+    # then the ad group ad last.
+    resource_names = [
+        _extract_resource_name(resp) for resp in response.mutate_operation_responses
+    ]
     results: dict = {}
-    for i, resp in enumerate(response.mutate_operation_responses):
-        rn = _extract_resource_name(resp)
-        if rn:
-            results["ad_group" if i == 0 else "ad_group_ad"] = rn
+    if resource_names:
+        results["ad_group"] = resource_names[0]
+        results["ad_group_ad"] = resource_names[-1]
+        asset_names = [rn for rn in resource_names[1:-1] if rn]
+        if asset_names:
+            results["assets"] = asset_names
 
     return results
 

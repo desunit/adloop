@@ -976,18 +976,25 @@ def draft_app_ad(
     descriptions: _StrList,
     customer_id: str = "",
     ad_group_name: str = "",
+    image_paths: _StrListOpt = None,
+    youtube_video_ids: _StrListOpt = None,
 ) -> dict:
-    """Draft the text assets (App ad) for an App campaign — PREVIEW, creates nothing.
+    """Draft the creative assets (App ad) for an App campaign — PREVIEW, creates nothing.
 
-    App campaigns have no keywords — the headlines, descriptions and store
-    listing ARE the creative. This creates an ad group + an App ad carrying the
-    text ideas Google rotates across Search, Play, YouTube and Display. Add
-    images/videos separately in the Google Ads UI.
+    App campaigns have no keywords — the headlines, descriptions, images, videos
+    and store listing ARE the creative. This creates an ad group + an App ad
+    carrying the assets Google rotates across Search, Play, YouTube and Display.
 
     campaign_id: the App campaign to add the ad to (from draft_app_campaign).
     headlines: 1-5 short text ideas, each <=30 characters.
     descriptions: 1-5 longer text ideas, each <=90 characters.
     ad_group_name: optional name for the ad group that holds the ad.
+    image_paths: optional 0-20 local PNG/JPEG/GIF files uploaded as image assets
+        on the App ad. App-campaign image creative must live on the App ad —
+        draft_image_assets (campaign-level CampaignAssets) does NOT work for App
+        campaigns.
+    youtube_video_ids: optional 0-20 YouTube video IDs or watch URLs uploaded as
+        video assets on the App ad.
 
     Call confirm_and_apply with the returned plan_id to execute.
     """
@@ -1000,6 +1007,8 @@ def draft_app_ad(
         headlines=headlines,
         descriptions=descriptions,
         ad_group_name=ad_group_name,
+        image_paths=image_paths,
+        youtube_video_ids=youtube_video_ids,
     )
 
 

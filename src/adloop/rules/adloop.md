@@ -280,6 +280,13 @@ Steps:
    installs, so a value tuned for installs will throttle delivery — flag this to the user).
 5. Re-run the verification GAQL after `confirm_and_apply` and have the user refresh the
    bidding panel to confirm the download dropdown is populated and the error is gone.
+6. Add creative with `draft_app_ad`. App-campaign creative lives on the **App ad**, not as
+   campaign-level assets — `draft_app_ad` carries `headlines` (1-5, ≤30 chars),
+   `descriptions` (1-5, ≤90 chars), `image_paths` (0-20 local PNG/JPEG/GIF), and
+   `youtube_video_ids` (0-20). Do NOT use `draft_image_assets` for App campaigns — that
+   attaches `CampaignAsset` AD_IMAGE links, which App campaigns ignore. `draft_app_ad`
+   creates a new ad group + App ad; a UAC campaign typically wants ONE ad group, so add all
+   text/image/video assets in a single `draft_app_ad` call rather than several.
 
 ### When user wants to add an ad group to an existing campaign
 

@@ -695,6 +695,85 @@ def test_apply_create_app_ad_builds_ad_group_and_app_ad():
     assert results["ad_group_ad"] == "customers/1234567890/adGroupAds/55~99"
 
 
+def test_apply_create_app_ad_attaches_image_and_video_assets(tmp_path):
+    image_file = tmp_path / "ad.png"
+    image_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+
+    google_ads_service = _FakeGoogleAdsService(
+        [
+            _FakeMutateOperationResponse(
+                "ad_group_result", "customers/1234567890/adGroups/55"
+            ),
+            _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/77"),
+            _FakeMutateOperationResponse("asset_result", "customers/1234567890/assets/78"),
+            _FakeMutateOperationResponse(
+                "ad_group_ad_result", "customers/1234567890/adGroupAds/55~99"
+            ),
+        ]
+    )
+    client = _FakeClient(
+        {
+            "GoogleAdsService": google_ads_service,
+            "CampaignService": _FakePathService("campaigns"),
+            "AdGroupService": _FakePathService("adGroups"),
+            "AssetService": _FakePathService("assets"),
+        }
+    )
+
+    results = write._apply_create_app_ad(
+        client,
+        "1234567890",
+        {
+            "campaign_id": "2",
+            "ad_group_name": "Ad group 1",
+            "headlines": ["Hero Headline"],
+            "descriptions": ["A great description."],
+            "images": [
+                {
+                    "path": str(image_file),
+                    "name": "AdLoop image ad",
+                    "mime_type": "image/png",
+                    "width": 1200,
+                    "height": 628,
+                }
+            ],
+            "youtube_video_ids": ["dQw4w9WgXcQ"],
+        },
+    )
+
+    ops = google_ads_service.operations
+    # ad group, image asset, video asset, ad group ad
+    assert len(ops) == 4
+    image_asset = ops[1].asset_operation.create
+    video_asset = ops[2].asset_operation.create
+    assert image_asset.type_ == client.enums.AssetTypeEnum.IMAGE
+    assert image_asset.image_asset.full_size.width_pixels == 1200
+    assert video_asset.type_ == client.enums.AssetTypeEnum.YOUTUBE_VIDEO
+    assert video_asset.youtube_video_asset.youtube_video_id == "dQw4w9WgXcQ"
+
+    app_ad = ops[3].ad_group_ad_operation.create.ad.app_ad
+    assert [img.asset for img in app_ad.images] == [image_asset.resource_name]
+    assert [vid.asset for vid in app_ad.youtube_videos] == [video_asset.resource_name]
+    assert results["assets"] == [
+        "customers/1234567890/assets/77",
+        "customers/1234567890/assets/78",
+    ]
+    assert results["ad_group_ad"] == "customers/1234567890/adGroupAds/55~99"
+
+
+def test_draft_app_ad_validates_image_files(config):
+    result = write.draft_app_ad(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="2",
+        headlines=["Hero Headline"],
+        descriptions=["A great description."],
+        image_paths=["/nonexistent/missing.png"],
+    )
+    assert "error" in result
+    assert any("Image 1" in d for d in result["details"])
+
+
 def test_draft_structured_snippets_rejects_invalid_header(config):
     result = write.draft_structured_snippets(
         config,
