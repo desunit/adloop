@@ -937,8 +937,15 @@ def draft_app_campaign(
         cost (IN_APP_ACTIONS goal). Google recommends daily_budget >= 50x this.
     app_optimization_goal: INSTALLS (optimize for install volume) | IN_APP_ACTIONS
         (optimize for in-app conversions — requires conversion_action_ids).
-    conversion_action_ids: in-app conversion action IDs to optimize toward;
-        REQUIRED when app_optimization_goal is IN_APP_ACTIONS.
+    conversion_action_ids: the conversion actions the campaign uses. REQUIRED
+        when app_optimization_goal is IN_APP_ACTIONS — and it must include BOTH
+        (1) the app's install/download conversion (category DOWNLOAD, e.g. the
+        Google Play "... - download" action) so installs are tracked, AND
+        (2) the in-app action(s) to optimize toward (e.g. begin_checkout,
+        purchase). Passing only the in-app action makes Google reject the
+        campaign with "Install conversion missing from campaign". Find the
+        download conversion id via get_tracking_events / a conversion_action
+        GAQL query filtered to category = DOWNLOAD for this app_id.
     geo_target_ids: REQUIRED geo target constant IDs (e.g. ["2840"] USA, ["2826"] UK).
     language_ids: REQUIRED language constant IDs (e.g. ["1000"] English).
 
@@ -1059,8 +1066,13 @@ def update_campaign(
         optimizes for: INSTALLS (install volume) | IN_APP_ACTIONS (in-app
         conversions). With IN_APP_ACTIONS, pass conversion_action_ids and
         target_cpa (the target in-app action cost).
-    conversion_action_ids: App campaigns only — the in-app conversion action IDs
-        to optimize toward (required with app_optimization_goal=IN_APP_ACTIONS).
+    conversion_action_ids: App campaigns only — REPLACES the campaign's
+        selective_optimization conversion list. For INSTALLS pass the single
+        install/download conversion (category DOWNLOAD). For IN_APP_ACTIONS pass
+        BOTH the install/download conversion AND the in-app action(s) to
+        optimize toward — an in-app-action campaign with no DOWNLOAD conversion
+        is rejected by Google with "Install conversion missing from campaign"
+        and the bidding panel shows "Select a download conversion action".
     bidding_strategy: MAXIMIZE_CONVERSIONS | TARGET_CPA | TARGET_ROAS |
                       MAXIMIZE_CONVERSION_VALUE | TARGET_SPEND | MANUAL_CPC
     target_cpa: required if bidding_strategy is TARGET_CPA (in account currency)

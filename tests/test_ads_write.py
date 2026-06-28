@@ -295,11 +295,11 @@ def test_update_campaign_rename(config):
         config,
         customer_id="123-456-7890",
         campaign_id="1001",
-        name="PC-US-Lite",
+        name="Example-App",
     )
 
     assert result["operation"] == "update_campaign"
-    assert result["changes"]["name"] == "PC-US-Lite"
+    assert result["changes"]["name"] == "Example-App"
 
 
 def test_apply_update_campaign_rename_sets_name_field_mask():
@@ -316,11 +316,11 @@ def test_apply_update_campaign_rename_sets_name_field_mask():
     write._apply_update_campaign(
         client,
         "1234567890",
-        {"campaign_id": "1001", "name": "PC-US-Lite"},
+        {"campaign_id": "1001", "name": "Example-App"},
     )
 
     op = google_ads_service.operations[0].campaign_operation
-    assert op.update.name == "PC-US-Lite"
+    assert op.update.name == "Example-App"
     assert "name" in list(op.update_mask.paths)
 
 
@@ -328,8 +328,8 @@ def test_draft_app_campaign_returns_preview(config):
     result = write.draft_app_campaign(
         config,
         customer_id="123-456-7890",
-        campaign_name="PC-US-Lite",
-        app_id="com.binitex.pianochords",
+        campaign_name="Example-App",
+        app_id="com.example.app",
         app_store="GOOGLE_APP_STORE",
         daily_budget=20,
         target_cpa=0.40,
@@ -339,7 +339,7 @@ def test_draft_app_campaign_returns_preview(config):
     )
 
     assert result["operation"] == "create_app_campaign"
-    assert result["changes"]["app_id"] == "com.binitex.pianochords"
+    assert result["changes"]["app_id"] == "com.example.app"
     assert result["changes"]["app_optimization_goal"] == "INSTALLS"
     # 20 == 50 * 0.40, so the learning-budget warning should NOT fire.
     assert "warnings" not in result
@@ -349,7 +349,7 @@ def test_draft_app_campaign_requires_app_id_and_target_cpa(config):
     result = write.draft_app_campaign(
         config,
         customer_id="123-456-7890",
-        campaign_name="PC-US-Lite",
+        campaign_name="Example-App",
         daily_budget=20,
         geo_target_ids=["2840"],
         language_ids=["1000"],
@@ -365,8 +365,8 @@ def test_draft_app_campaign_in_app_actions_requires_conversion_ids(config):
     result = write.draft_app_campaign(
         config,
         customer_id="123-456-7890",
-        campaign_name="PC-US-Lite",
-        app_id="com.binitex.pianochords",
+        campaign_name="Example-App",
+        app_id="com.example.app",
         daily_budget=20,
         target_cpa=8,
         app_optimization_goal="IN_APP_ACTIONS",
@@ -376,6 +376,56 @@ def test_draft_app_campaign_in_app_actions_requires_conversion_ids(config):
 
     assert result["error"] == "Validation failed"
     assert any("conversion_action_ids is required" in d for d in result["details"])
+
+
+def test_draft_app_campaign_in_app_actions_missing_download_is_blocked(config, monkeypatch):
+    # IN_APP_ACTIONS with only an in-app action and no DOWNLOAD conversion is
+    # rejected up front instead of producing a campaign Google won't run.
+    monkeypatch.setattr(
+        write,
+        "_conversion_action_categories",
+        lambda *_a, **_kw: {"2222222222": "BEGIN_CHECKOUT"},
+    )
+    result = write.draft_app_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_name="Example-App",
+        app_id="com.example.app",
+        daily_budget=400,
+        target_cpa=8,
+        app_optimization_goal="IN_APP_ACTIONS",
+        conversion_action_ids=["2222222222"],
+        geo_target_ids=["2840"],
+        language_ids=["1000"],
+    )
+
+    assert result["error"] == "Validation failed"
+    assert any("DOWNLOAD" in d and "Install conversion missing" in d for d in result["details"])
+
+
+def test_draft_app_campaign_in_app_actions_with_download_ok(config, monkeypatch):
+    # DOWNLOAD (install tracking) + in-app action is the correct config.
+    monkeypatch.setattr(
+        write,
+        "_conversion_action_categories",
+        lambda *_a, **_kw: {"1111111111": "DOWNLOAD", "2222222222": "BEGIN_CHECKOUT"},
+    )
+    result = write.draft_app_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_name="Example-App",
+        app_id="com.example.app",
+        daily_budget=20,
+        target_cpa=0.40,
+        app_optimization_goal="IN_APP_ACTIONS",
+        conversion_action_ids=["1111111111", "2222222222"],
+        geo_target_ids=["2840"],
+        language_ids=["1000"],
+    )
+
+    assert result["operation"] == "create_app_campaign"
+    assert result["changes"]["conversion_action_ids"] == ["1111111111", "2222222222"]
+    assert "warnings" not in result
 
 
 def test_apply_create_app_campaign_builds_app_settings():
@@ -409,8 +459,8 @@ def test_apply_create_app_campaign_builds_app_settings():
         client,
         "1234567890",
         {
-            "campaign_name": "PC-US-Lite",
-            "app_id": "com.binitex.pianochords",
+            "campaign_name": "Example-App",
+            "app_id": "com.example.app",
             "app_store": "GOOGLE_APP_STORE",
             "daily_budget": 20,
             "target_cpa": 0.40,
@@ -431,7 +481,7 @@ def test_apply_create_app_campaign_builds_app_settings():
         campaign.advertising_channel_sub_type
         == enums.AdvertisingChannelSubTypeEnum.APP_CAMPAIGN
     )
-    assert campaign.app_campaign_setting.app_id == "com.binitex.pianochords"
+    assert campaign.app_campaign_setting.app_id == "com.example.app"
     assert (
         campaign.app_campaign_setting.app_store
         == enums.AppCampaignAppStoreEnum.GOOGLE_APP_STORE
@@ -459,20 +509,71 @@ def test_update_campaign_app_goal_requires_conversion_ids(config):
     assert any("conversion_action_ids is required" in d for d in result["details"])
 
 
-def test_update_campaign_app_goal_preview(config):
+def test_update_campaign_app_goal_preview(config, monkeypatch):
+    # A valid in-app-action config carries BOTH a DOWNLOAD (install) conversion
+    # and the in-app action. Stub the category lookup so the test is hermetic.
+    monkeypatch.setattr(
+        write,
+        "_conversion_action_categories",
+        lambda *_a, **_kw: {"1111111111": "DOWNLOAD", "2222222222": "BEGIN_CHECKOUT"},
+    )
     result = write.update_campaign(
         config,
         customer_id="123-456-7890",
         campaign_id="1001",
         app_optimization_goal="IN_APP_ACTIONS",
-        conversion_action_ids=["7584841862"],
+        conversion_action_ids=["1111111111", "2222222222"],
         target_cpa=3.0,
     )
 
     assert result["operation"] == "update_campaign"
     assert result["changes"]["app_optimization_goal"] == "IN_APP_ACTIONS"
-    assert result["changes"]["conversion_action_ids"] == ["7584841862"]
+    assert result["changes"]["conversion_action_ids"] == ["1111111111", "2222222222"]
     assert result["changes"]["target_cpa"] == 3.0
+    # Both an install conversion and an in-app action are present — no warning.
+    assert "warnings" not in result
+
+
+def test_update_campaign_in_app_actions_missing_download_is_blocked(config, monkeypatch):
+    # Only an in-app action, no DOWNLOAD conversion — this is exactly the config
+    # Google rejects with "Install conversion missing from campaign".
+    monkeypatch.setattr(
+        write,
+        "_conversion_action_categories",
+        lambda *_a, **_kw: {"2222222222": "BEGIN_CHECKOUT"},
+    )
+    result = write.update_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        app_optimization_goal="IN_APP_ACTIONS",
+        conversion_action_ids=["2222222222"],
+        target_cpa=3.0,
+    )
+
+    assert result["error"] == "Validation failed"
+    assert any("DOWNLOAD" in d and "Install conversion missing" in d for d in result["details"])
+
+
+def test_update_campaign_in_app_actions_only_download_warns(config, monkeypatch):
+    # A DOWNLOAD conversion but no in-app action — valid for Google, but the
+    # campaign then behaves like install-volume; surface a warning, not an error.
+    monkeypatch.setattr(
+        write,
+        "_conversion_action_categories",
+        lambda *_a, **_kw: {"1111111111": "DOWNLOAD"},
+    )
+    result = write.update_campaign(
+        config,
+        customer_id="123-456-7890",
+        campaign_id="1001",
+        app_optimization_goal="IN_APP_ACTIONS",
+        conversion_action_ids=["1111111111"],
+        target_cpa=3.0,
+    )
+
+    assert "error" not in result
+    assert any("no in-app action" in w for w in result.get("warnings", []))
 
 
 def test_apply_update_campaign_switches_app_goal():
@@ -493,7 +594,7 @@ def test_apply_update_campaign_switches_app_goal():
         {
             "campaign_id": "1001",
             "app_optimization_goal": "IN_APP_ACTIONS",
-            "conversion_action_ids": ["7584841862"],
+            "conversion_action_ids": ["2222222222"],
             "target_cpa": 3.0,
         },
     )
@@ -507,7 +608,7 @@ def test_apply_update_campaign_switches_app_goal():
     )
     assert campaign.target_cpa.target_cpa_micros == 3_000_000
     assert list(campaign.selective_optimization.conversion_actions) == [
-        "customers/1234567890/conversionActions/7584841862"
+        "customers/1234567890/conversionActions/2222222222"
     ]
     paths = list(op.update_mask.paths)
     assert "app_campaign_setting.bidding_strategy_goal_type" in paths

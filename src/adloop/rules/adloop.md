@@ -244,6 +244,43 @@ Most websites (especially in the EU) use a GDPR cookie consent banner. This has 
    - Enable the campaign via `enable_entity` only after ads and sitelinks are in place
 8. Wait for explicit user approval before calling `confirm_and_apply`
 
+### When user wants to create or fix an App campaign (installs / in-app actions)
+
+App campaigns are `MULTI_CHANNEL` / `APP_CAMPAIGN` (no keywords, no ad groups). They bid
+via `TargetCpa` on the campaign's `app_campaign_setting.bidding_strategy_goal_type` and a
+`selective_optimization.conversion_actions` list. Use `draft_app_campaign` to create and
+`update_campaign` (with `app_optimization_goal` + `conversion_action_ids`) to reconfigure.
+
+**The #1 App-campaign pitfall — "Install conversion missing from campaign".** Google
+requires every App campaign to track an **install/download** conversion (a conversion action
+of category `DOWNLOAD` — e.g. the Google Play "… - download" action for the app's package).
+
+- **Install volume goal** (`INSTALLS` → `OPTIMIZE_INSTALLS_TARGET_INSTALL_COST`): pass the
+  single DOWNLOAD conversion as `conversion_action_ids`.
+- **In-app actions goal** (`IN_APP_ACTIONS` → `OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST`):
+  pass **BOTH** the DOWNLOAD conversion **AND** the in-app action(s) (e.g. `begin_checkout`,
+  `purchase`) in `conversion_action_ids`. `conversion_action_ids` REPLACES the whole
+  `selective_optimization` list — omit the download conversion and Google rejects the campaign
+  with *"Install conversion missing from campaign"* and the bidding panel shows *"Select a
+  download conversion action"*. AdLoop now **hard-blocks** this at draft time: an
+  `IN_APP_ACTIONS` draft whose `conversion_action_ids` contains no category-`DOWNLOAD`
+  conversion fails validation (it looks up each ID's category), and an all-DOWNLOAD list
+  (no in-app action) gets a warning.
+
+Steps:
+1. Find the app's conversion actions:
+   `SELECT conversion_action.id, conversion_action.name, conversion_action.category, conversion_action.app_id FROM conversion_action WHERE conversion_action.app_id = '{package_or_appstore_id}' AND conversion_action.status = 'ENABLED'`.
+   Pick the `category = DOWNLOAD` one as the install tracker; pick the desired in-app event(s).
+2. Verify the current config when fixing an existing campaign:
+   `SELECT campaign.app_campaign_setting.bidding_strategy_goal_type, campaign.selective_optimization.conversion_actions, campaign.target_cpa.target_cpa_micros FROM campaign WHERE campaign.id = {id}`.
+3. Draft via `draft_app_campaign` (new) or `update_campaign` (existing) with the right
+   `app_optimization_goal` and the full `conversion_action_ids` per the rule above.
+4. Note the `target_cpa` meaning changes with the goal: cost-per-install for `INSTALLS`,
+   cost-per-in-app-action for `IN_APP_ACTIONS` (begin_checkout/purchase are far rarer than
+   installs, so a value tuned for installs will throttle delivery — flag this to the user).
+5. Re-run the verification GAQL after `confirm_and_apply` and have the user refresh the
+   bidding panel to confirm the download dropdown is populated and the error is gone.
+
 ### When user wants to add an ad group to an existing campaign
 
 1. Call `get_campaign_performance` to identify the target campaign and verify it exists

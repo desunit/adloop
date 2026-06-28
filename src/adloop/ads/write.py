@@ -947,8 +947,12 @@ def draft_app_campaign(
         conversions; target_cpa is the target action cost — requires
         conversion_action_ids).
     target_cpa: REQUIRED — target install or in-app action cost (account currency).
-    conversion_action_ids: in-app conversion action IDs to optimize toward;
-        REQUIRED when app_optimization_goal is IN_APP_ACTIONS.
+    conversion_action_ids: the conversion actions the campaign uses. REQUIRED
+        when app_optimization_goal is IN_APP_ACTIONS — and it must include BOTH
+        the install/download conversion (category DOWNLOAD) AND the in-app
+        action(s) to optimize toward. An in-app-action campaign without a
+        DOWNLOAD conversion is rejected by Google with "Install conversion
+        missing from campaign".
 
     Call confirm_and_apply with the returned plan_id to execute.
     """
@@ -1224,8 +1228,19 @@ def update_campaign(
     if goal == "IN_APP_ACTIONS" and not conversion_action_ids:
         errors.append(
             "conversion_action_ids is required when app_optimization_goal is "
-            "IN_APP_ACTIONS (the in-app conversion action(s) to optimize toward)"
+            "IN_APP_ACTIONS — pass BOTH the install/download conversion "
+            "(category DOWNLOAD) AND the in-app action(s) to optimize toward. "
+            "conversion_action_ids REPLACES selective_optimization, so an "
+            "in-app-action campaign needs the download conversion listed here "
+            "too or Google rejects it with 'Install conversion missing'."
         )
+    elif goal == "IN_APP_ACTIONS":
+        # Enforce that the replacement conversion list still tracks installs.
+        conv_errors, conv_warnings = _check_app_install_conversion(
+            config, customer_id, goal, conversion_action_ids
+        )
+        errors.extend(conv_errors)
+        warnings.extend(conv_warnings)
     if conversion_action_ids is not None and not goal:
         errors.append(
             "conversion_action_ids only applies together with app_optimization_goal"
@@ -1791,6 +1806,101 @@ def _ad_group_campaign_bidding_strategy(
     return rows[0].get("campaign.bidding_strategy_type")
 
 
+def _conversion_action_categories(
+    config: AdLoopConfig, customer_id: str, conversion_action_ids: list[str]
+) -> dict[str, str] | None:
+    """Return ``{conversion_action_id: category}`` for the given IDs.
+
+    Used to enforce that App campaigns optimizing for in-app actions still
+    carry an install/download conversion (category ``DOWNLOAD``). ``category``
+    comes back as the enum name (e.g. ``"DOWNLOAD"``, ``"PURCHASE"``,
+    ``"BEGIN_CHECKOUT"``). Returns ``None`` when the lookup can't be performed
+    (no IDs, non-numeric IDs, or a query failure) so callers can fall back to a
+    heuristic instead of blocking on an unverifiable input.
+    """
+    if not conversion_action_ids:
+        return None
+    from adloop.ads.gaql import execute_query
+
+    # conversion_action.id is an int64 — build a bare-number IN (...) list.
+    try:
+        id_list = ", ".join(str(int(cid)) for cid in conversion_action_ids)
+    except (TypeError, ValueError):
+        return None
+    query = f"""
+        SELECT conversion_action.id, conversion_action.category
+        FROM conversion_action
+        WHERE conversion_action.id IN ({id_list})
+    """
+    try:
+        rows = execute_query(config, customer_id, query)
+    except Exception:
+        return None
+    categories: dict[str, str] = {}
+    for row in rows:
+        cid = str(row.get("conversion_action.id") or "")
+        cat = row.get("conversion_action.category") or ""
+        if cid:
+            categories[cid] = cat
+    return categories or None
+
+
+def _check_app_install_conversion(
+    config: AdLoopConfig,
+    customer_id: str,
+    goal: str,
+    conversion_action_ids: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Guard against the "Install conversion missing from campaign" error.
+
+    For ``IN_APP_ACTIONS`` App campaigns, ``conversion_action_ids`` REPLACES the
+    campaign's whole ``selective_optimization`` list, so it must contain BOTH a
+    DOWNLOAD/install conversion AND the in-app action(s). Looks up the actual
+    category of each provided ID and hard-errors when no DOWNLOAD conversion is
+    present. Falls back to a heuristic nudge when categories can't be verified.
+    Returns ``(errors, warnings)``.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    if goal != "IN_APP_ACTIONS" or not conversion_action_ids:
+        return errors, warnings
+
+    categories = _conversion_action_categories(
+        config, customer_id, conversion_action_ids
+    )
+    if categories is None:
+        # Couldn't verify categories (offline/unknown IDs) — nudge instead of block.
+        if len(conversion_action_ids) < 2:
+            warnings.append(
+                "Could not verify conversion categories. IN_APP_ACTIONS replaces "
+                "the campaign's conversion list, so it needs BOTH an "
+                "install/download conversion AND the in-app action — only one ID "
+                "was provided. If it is not the DOWNLOAD/install conversion, "
+                "Google rejects the campaign with 'Install conversion missing'."
+            )
+        return errors, warnings
+
+    has_download = any(cat == "DOWNLOAD" for cat in categories.values())
+    has_in_app = any(cat and cat != "DOWNLOAD" for cat in categories.values())
+    if not has_download:
+        errors.append(
+            "IN_APP_ACTIONS requires an install/download conversion (category "
+            "DOWNLOAD) in conversion_action_ids — none of the provided IDs "
+            f"{sorted(categories)} is a DOWNLOAD conversion. Google rejects such "
+            "campaigns with 'Install conversion missing from campaign'. Add the "
+            "app's DOWNLOAD conversion (e.g. the Google Play '… - download' "
+            "action) alongside the in-app action(s)."
+        )
+    if not has_in_app:
+        warnings.append(
+            "All provided conversion_action_ids are DOWNLOAD conversions — no "
+            "in-app action is set to optimize toward, so IN_APP_ACTIONS behaves "
+            "like an install-volume campaign. Add the in-app action(s) (e.g. "
+            "begin_checkout, purchase) to optimize for them."
+        )
+    return errors, warnings
+
+
 def _validate_callouts(
     campaign_id: str, callouts: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -2164,8 +2274,17 @@ def _validate_app_campaign(
     if goal == "IN_APP_ACTIONS" and not conversion_action_ids:
         errors.append(
             "conversion_action_ids is required when app_optimization_goal is "
-            "IN_APP_ACTIONS (the in-app conversion action(s) to optimize toward)"
+            "IN_APP_ACTIONS — pass BOTH the install/download conversion "
+            "(category DOWNLOAD) AND the in-app action(s) to optimize toward"
         )
+    else:
+        # Enforce that an in-app-action campaign also tracks installs — the
+        # campaign is rejected with "Install conversion missing" otherwise.
+        conv_errors, conv_warnings = _check_app_install_conversion(
+            config, customer_id, goal, conversion_action_ids
+        )
+        errors.extend(conv_errors)
+        warnings.extend(conv_warnings)
 
     # App campaigns need volume to exit the learning phase. Google recommends a
     # daily budget of at least 50x the target CPA — below this the algorithm
